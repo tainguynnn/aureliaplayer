@@ -1,13 +1,25 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
+import { ACCENT_PALETTES, applyAppearanceTokens, getPalette, extractDominantColor } from './theme';
+import { getTranslation } from './i18n';
+import {
+  BUILTIN_PEQ_PRESETS,
+  validateAndNormalizePeqState,
+  applyPeqToAudioNodes
+} from './peqEngine';
+import PeqPanel from './components/PeqPanel';
+import MiniPlayerOverlay from './components/MiniPlayerOverlay';
 import {
   Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Volume1,
   Repeat, Repeat1, Shuffle, Music, Disc, FolderOpen, Upload,
   Search, Activity, Settings,
-  Plus, X, Maximize2, Minimize2, Sparkles, AlertCircle,
+  Plus, X, Maximize2, Minimize2, Sparkles, AlertCircle, Trash2,
   RefreshCw, ListMusic, HardDrive,
   Shield, Zap, BarChart2, CheckCircle2,
   ArrowUpDown, SlidersHorizontal, Heart, LayoutGrid, List, ChevronUp, ChevronDown,
-  AlignCenter, Globe, ExternalLink
+  AlignCenter, Globe, ExternalLink, Pin, EyeOff, Sun, Moon, Palette, Check
 } from 'lucide-react';
 
 const SUPPORTED_CODECS = [
@@ -33,7 +45,7 @@ function isDesktopShell() {
   if (typeof window === 'undefined') return false;
   return Boolean(
     window.aureliaWindow ||
-    window.__TAURI__ ||
+    window.__TAURI__ |
     window.__TAURI_INTERNALS__ ||
     window.pywebview ||
     /Electron\//.test(navigator.userAgent || '')
@@ -1835,8 +1847,53 @@ export default function App() {
     autoOnlineMetadata: true,
     keyboardShortcuts: true,
     eqPreset: 'flat', // 'flat' | 'warmth' | 'air' | 'vocal'
-    gapless: true // preload the next track and start it the instant this one ends
+    gapless: true, // preload the next track and start it the instant this one ends
+    themeMode: 'dark',
+    accentColor: 'amber',
+    customAccentHex: '#f59e0b',
+    language: 'vi', // 'vi' | 'en'
+    autoAlbumTheme: false
   });
+  const [showColorPickerPopover, setShowColorPickerPopover] = useState(false);
+  const colorPickerRef = useRef(null);
+  const [localCustomHex, setLocalCustomHex] = useState(settings.customAccentHex || '#f59e0b');
+
+  const t = useCallback(
+    (key, fallback = '') => getTranslation(settings.language || 'vi', key, fallback),
+    [settings.language]
+  );
+
+  useEffect(() => {
+    if (settings.customAccentHex) {
+      setLocalCustomHex(settings.customAccentHex);
+    }
+  }, [settings.customAccentHex]);
+
+  const activePalette = useMemo(() => {
+    return getPalette(settings.accentColor || 'amber', settings.customAccentHex || '#f59e0b');
+  }, [settings.accentColor, settings.customAccentHex]);
+
+  const activePaletteRef = useRef(activePalette);
+  activePaletteRef.current = activePalette;
+
+  useEffect(() => {
+    applyAppearanceTokens(
+      settings.themeMode || 'dark',
+      settings.accentColor || 'amber',
+      settings.customAccentHex || '#f59e0b'
+    );
+  }, [settings.themeMode, settings.accentColor, settings.customAccentHex]);
+
+  useEffect(() => {
+    if (!showColorPickerPopover) return;
+    const handleClickOutside = (e) => {
+      if (colorPickerRef.current && !colorPickerRef.current.contains(e.target)) {
+        setShowColorPickerPopover(false);
+      }
+    };
+    window.addEventListener('pointerdown', handleClickOutside);
+    return () => window.removeEventListener('pointerdown', handleClickOutside);
+  }, [showColorPickerPopover]);
   const [envStatus, setEnvStatus] = useState({
     indexedDbReady: false,
     webAudioReady: false,
@@ -2158,39 +2215,16 @@ export default function App() {
         setSettings((prev) => ({ ...prev, ...savedConfig.value }));
       }
 
-      // Restore remembered music folder handle or fallback folder record
+      // Restore remembered music folder record natively without localhost permission prompts
       if (savedFolderRecord) {
-        if (savedFolderRecord.handle && typeof savedFolderRecord.handle.queryPermission === 'function') {
-          try {
-            const perm = await savedFolderRecord.handle.queryPermission({ mode: 'read' });
-            setRememberedFolder({
-              handle: savedFolderRecord.handle,
-              name: savedFolderRecord.name || savedFolderRecord.handle.name,
-              mode: 'fs-handle',
-              permissionState: perm,
-              trackCount: savedFolderRecord.trackCount || 0,
-              lastScannedAt: savedFolderRecord.lastScannedAt || null
-            });
-          } catch (e) {
-            setRememberedFolder({
-              handle: savedFolderRecord.handle,
-              name: savedFolderRecord.name || 'Saved Music Folder',
-              mode: 'fs-handle',
-              permissionState: 'prompt',
-              trackCount: savedFolderRecord.trackCount || 0,
-              lastScannedAt: savedFolderRecord.lastScannedAt || null
-            });
-          }
-        } else {
-          setRememberedFolder({
-            handle: null,
-            name: savedFolderRecord.name || 'Local Music Folder',
-            mode: 'idb-fallback',
-            permissionState: 'sandbox-fallback',
-            trackCount: savedFolderRecord.trackCount || 0,
-            lastScannedAt: savedFolderRecord.lastScannedAt || null
-          });
-        }
+        setRememberedFolder({
+          handle: null,
+          name: savedFolderRecord.name || 'Local Music Folder',
+          mode: 'native-folder',
+          permissionState: 'granted',
+          trackCount: savedFolderRecord.trackCount || 0,
+          lastScannedAt: savedFolderRecord.lastScannedAt || null
+        });
       }
     }
 
@@ -2735,10 +2769,15 @@ export default function App() {
             const x = i * (barWidth + gap);
             const y = height - barH;
 
+            const pal = activePaletteRef.current || activePalette;
+            const r500 = (pal?.rgb500 || '245 158 11').split(' ').join(', ');
+            const r400 = (pal?.rgb400 || '251 191 36').split(' ').join(', ');
+            const r300 = (pal?.rgb300 || '253 224 71').split(' ').join(', ');
+
             const grad = ctx.createLinearGradient(0, height, 0, 0);
-            grad.addColorStop(0, 'rgba(245, 158, 11, 0.22)');
-            grad.addColorStop(0.6, 'rgba(251, 191, 36, 0.68)');
-            grad.addColorStop(1, 'rgba(253, 224, 71, 0.92)');
+            grad.addColorStop(0, `rgba(${r500}, 0.22)`);
+            grad.addColorStop(0.6, `rgba(${r400}, 0.68)`);
+            grad.addColorStop(1, `rgba(${r300}, 0.92)`);
             ctx.fillStyle = grad;
             ctx.beginPath();
             if (typeof ctx.roundRect === 'function') {
@@ -2755,7 +2794,7 @@ export default function App() {
 
     animationId = requestAnimationFrame(renderVisualizer);
     return () => cancelAnimationFrame(animationId);
-  }, [isPlaying, fullscreenMode]);
+  }, [isPlaying, fullscreenMode, activePalette]);
 
   useEffect(() => {
     let audio = audioRef.current;
@@ -3582,58 +3621,10 @@ export default function App() {
     [processNormalizedImportEntries, settings.rememberMusicFolder]
   );
 
-  const handleSelectOrRestoreFolder = useCallback(
-    async (existingHandle = null) => {
-      // 1. If we have an existing FileSystemDirectoryHandle or showDirectoryPicker is supported outside cross-origin iframe
-      if (existingHandle || (typeof window.showDirectoryPicker === 'function' && !envStatus.isCrossOriginIframe)) {
-        try {
-          const dirHandle = existingHandle || (await window.showDirectoryPicker({ mode: 'read' }));
-          if (existingHandle && typeof dirHandle.requestPermission === 'function') {
-            const perm = await dirHandle.requestPermission({ mode: 'read' });
-            if (perm !== 'granted') {
-              setRememberedFolder((prev) => ({ ...prev, permissionState: perm }));
-              showToast('Folder read permission was not granted by the browser.', 'error');
-              return;
-            }
-          }
-
-          const stats = { folders: 0, errors: 0, skippedNonAudio: 0 };
-          const entries = await traverseDirectoryHandleRecursive(dirHandle, dirHandle.name, stats);
-          const nowIso = new Date().toISOString();
-
-          if (settings.rememberMusicFolder) {
-            await dbPut('handles', {
-              key: 'musicFolder',
-              handle: dirHandle,
-              name: dirHandle.name,
-              mode: 'fs-handle',
-              trackCount: entries.length,
-              lastScannedAt: nowIso
-            });
-          }
-
-          setRememberedFolder({
-            handle: dirHandle,
-            name: dirHandle.name,
-            mode: 'fs-handle',
-            permissionState: 'granted',
-            trackCount: entries.length,
-            lastScannedAt: nowIso
-          });
-
-          await processNormalizedImportEntries(entries, dirHandle.name, stats);
-          return;
-        } catch (err) {
-          if (err?.name === 'AbortError') return;
-          // Fall through to webkitdirectory picker if blocked by iframe SecurityError
-        }
-      }
-
-      // 2. Fallback to standard webkitdirectory input (works in Canvas cross-origin iframe)
-      folderInputRef.current?.click();
-    },
-    [envStatus.isCrossOriginIframe, processNormalizedImportEntries, settings.rememberMusicFolder, showToast]
-  );
+  const handleSelectOrRestoreFolder = useCallback(() => {
+    // Standard native directory picker - zero localhost permission prompts
+    folderInputRef.current?.click();
+  }, []);
 
   const handleForgetRememberedFolder = useCallback(async () => {
     await dbDelete('handles', 'musicFolder');
@@ -3647,6 +3638,225 @@ export default function App() {
     });
     showToast('Cleared remembered music folder preference.', 'info');
   }, [showToast]);
+
+  const handleFindAndRemoveDuplicates = useCallback(() => {
+    if (!tracks || tracks.length < 2) {
+      showToast(t('noDuplicatesFound'), 'info');
+      return;
+    }
+
+    // Group tracks by normalized signature: title + artist
+    const groups = new Map();
+    for (const track of tracks) {
+      const normTitle = (track.title || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      const normArtist = (track.artist || track.albumArtist || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+      const key = `${normTitle}:::${normArtist}`;
+
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+      groups.get(key).push(track);
+    }
+
+    // Quality scoring function to pick the BEST master track to keep
+    const scoreTrackQuality = (trk) => {
+      let score = 0;
+      if (trk.audioBlob instanceof Blob || (typeof trk.objectUrl === 'string' && trk.objectUrl.startsWith('blob:'))) {
+        score += 1000;
+      }
+      const codec = String(trk.codec || '').toUpperCase();
+      if (codec.includes('FLAC') || codec.includes('ALAC') || codec.includes('WAV') || codec.includes('AIFF')) {
+        score += 500;
+      } else if (codec.includes('M4A') || codec.includes('AAC')) {
+        score += 300;
+      } else {
+        score += 200;
+      }
+      score += Number(trk.bitDepth || 16);
+      score += Math.min(192, (trk.sampleRate || 44100) / 1000);
+      if (trk.dspAnalysis?.estimatedBitrateKbps) {
+        score += trk.dspAnalysis.estimatedBitrateKbps * 0.1;
+      }
+      if (trk.isArtworkVerified || (trk.coverUrl && !trk.coverUrl.includes('placeholder'))) {
+        score += 40;
+      }
+      if (trk.embeddedLyrics || trk.syncedLyrics) {
+        score += 20;
+      }
+      return score;
+    };
+
+    const duplicateTracksToRemove = [];
+    const trackReplacementMap = new Map();
+
+    for (const [, trackList] of groups) {
+      if (trackList.length > 1) {
+        trackList.sort((a, b) => scoreTrackQuality(b) - scoreTrackQuality(a));
+        const masterTrack = trackList[0];
+        for (let i = 1; i < trackList.length; i++) {
+          const dup = trackList[i];
+          duplicateTracksToRemove.push(dup);
+          trackReplacementMap.set(dup.id, masterTrack.id);
+        }
+      }
+    }
+
+    if (duplicateTracksToRemove.length === 0) {
+      showToast(t('noDuplicatesFound'), 'info');
+      return;
+    }
+
+    setConfirmModal({
+      title: t('removeDuplicates'),
+      message: `${t('duplicatesCleaned').replace('{count}', duplicateTracksToRemove.length)} — Hệ thống sẽ tự động giữ lại bản thu chất lượng cao nhất (lossless, bitrate cao, đầy đủ ảnh bìa) và xóa các bản sao thừa. Bạn có chắc chắn muốn dọn dẹp?`,
+      onConfirm: async () => {
+        const dupIdSet = new Set(duplicateTracksToRemove.map((item) => item.id));
+
+        for (const dup of duplicateTracksToRemove) {
+          try {
+            await dbDelete('tracks', dup.id);
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        const remainingTracks = tracks.filter((item) => !dupIdSet.has(item.id));
+        setTracks(remainingTracks);
+
+        setQueue((prevQueue) => {
+          const updated = [];
+          const seen = new Set();
+          for (const id of prevQueue) {
+            const targetId = trackReplacementMap.has(id) ? trackReplacementMap.get(id) : id;
+            if (!dupIdSet.has(targetId) && !seen.has(targetId)) {
+              seen.add(targetId);
+              updated.push(targetId);
+            }
+          }
+          return updated.length > 0 ? updated : remainingTracks.map((item) => item.id);
+        });
+
+        if (currentTrackId && trackReplacementMap.has(currentTrackId)) {
+          setCurrentTrackId(trackReplacementMap.get(currentTrackId));
+        }
+
+        setPlaylists((prevPlaylists) => {
+          return prevPlaylists.map((pl) => {
+            if (!Array.isArray(pl.trackIds)) return pl;
+            const updatedIds = [];
+            const seen = new Set();
+            for (const id of pl.trackIds) {
+              const targetId = trackReplacementMap.has(id) ? trackReplacementMap.get(id) : id;
+              if (!dupIdSet.has(targetId) && !seen.has(targetId)) {
+                seen.add(targetId);
+                updatedIds.push(targetId);
+              }
+            }
+            const updatedPl = { ...pl, trackIds: updatedIds };
+            dbPut('playlists', updatedPl).catch(() => {});
+            return updatedPl;
+          });
+        });
+
+        showToast(
+          (t('duplicatesCleaned') || 'Đã xóa {count} bài hát trùng lặp').replace(
+            '{count}',
+            duplicateTracksToRemove.length
+          ),
+          'success'
+        );
+      }
+    });
+  }, [tracks, currentTrackId, showToast, t]);
+
+  const handleDeleteAlbum = useCallback((album) => {
+    if (!album || !album.tracks || album.tracks.length === 0) return;
+    setConfirmModal({
+      title: t('deleteAlbumConfirmTitle').replace('{title}', album.title),
+      message: t('deleteAlbumConfirmDesc')
+        .replace('{title}', album.title)
+        .replace('{count}', album.tracks.length),
+      onConfirm: async () => {
+        const albumTrackIds = new Set(album.tracks.map((item) => item.id));
+
+        for (const item of album.tracks) {
+          try {
+            await dbDelete('tracks', item.id);
+          } catch (e) {}
+        }
+
+        const remainingTracks = tracks.filter((item) => !albumTrackIds.has(item.id));
+        setTracks(remainingTracks);
+
+        setQueue((prevQueue) => {
+          const updated = prevQueue.filter((id) => !albumTrackIds.has(id));
+          return updated.length > 0 ? updated : remainingTracks.map((item) => item.id);
+        });
+
+        if (currentTrackId && albumTrackIds.has(currentTrackId)) {
+          const nextTrack = remainingTracks[0];
+          setCurrentTrackId(nextTrack ? nextTrack.id : null);
+          if (!nextTrack) {
+            setIsPlaying(false);
+          }
+        }
+
+        setPlaylists((prevPlaylists) => {
+          return prevPlaylists.map((pl) => {
+            if (!Array.isArray(pl.trackIds)) return pl;
+            const updatedIds = pl.trackIds.filter((id) => !albumTrackIds.has(id));
+            const updatedPl = { ...pl, trackIds: updatedIds };
+            dbPut('playlists', updatedPl).catch(() => {});
+            return updatedPl;
+          });
+        });
+
+        setSelectedAlbumId(null);
+        showToast(`Đã xóa album "${album.title}" khỏi thư viện.`, 'info');
+      }
+    });
+  }, [tracks, currentTrackId, showToast, t]);
+
+  const handleDeleteTrack = useCallback((trackId) => {
+    const trackToDelete = tracks.find((item) => item.id === trackId);
+    if (!trackToDelete) return;
+
+    setConfirmModal({
+      title: t('deleteTrack'),
+      message: t('deleteTrackConfirm').replace('{title}', trackToDelete.title),
+      onConfirm: async () => {
+        try {
+          await dbDelete('tracks', trackId);
+        } catch (e) {}
+
+        const remainingTracks = tracks.filter((item) => item.id !== trackId);
+        setTracks(remainingTracks);
+
+        setQueue((prevQueue) => {
+          const updated = prevQueue.filter((id) => id !== trackId);
+          return updated.length > 0 ? updated : remainingTracks.map((item) => item.id);
+        });
+
+        if (currentTrackId === trackId) {
+          const nextTrack = remainingTracks.find((item) => item.albumId === trackToDelete.albumId) || remainingTracks[0];
+          setCurrentTrackId(nextTrack ? nextTrack.id : null);
+          if (!nextTrack) setIsPlaying(false);
+        }
+
+        setPlaylists((prevPlaylists) => {
+          return prevPlaylists.map((pl) => {
+            if (!Array.isArray(pl.trackIds)) return pl;
+            const updatedIds = pl.trackIds.filter((id) => id !== trackId);
+            const updatedPl = { ...pl, trackIds: updatedIds };
+            dbPut('playlists', updatedPl).catch(() => {});
+            return updatedPl;
+          });
+        });
+
+        showToast(`Đã xóa "${trackToDelete.title}" khỏi thư viện.`, 'info');
+      }
+    });
+  }, [tracks, currentTrackId, showToast, t]);
 
   const runSelfDiagnosticsSuite = useCallback(async () => {
     // Build a virtual nested directory fixture with multiple albums, discs, and .m3u/.m3u8/.cue/.jpg non-audio files:
@@ -4081,15 +4291,60 @@ export default function App() {
     });
   };
 
-  const updateSetting = async (key, value) => {
-    const next = { ...settings, [key]: value };
-    setSettings(next);
-    await dbPut('settings', { key: 'appSettings', value: next });
-  };
+  const updateSettings = useCallback(async (patch) => {
+    setSettings((prev) => {
+      const next = typeof patch === 'function' ? patch(prev) : { ...prev, ...patch };
+      dbPut('settings', { key: 'appSettings', value: next }).catch((err) => console.error('Save settings error:', err));
+      return next;
+    });
+  }, []);
+
+  const updateSetting = useCallback((key, value) => {
+    updateSettings({ [key]: value });
+  }, [updateSettings]);
+
+  const handleExtractAlbumColor = useCallback(async () => {
+    if (!currentTrack?.coverUrl) {
+      showToast(t('noAlbumArtFound'), 'info');
+      return;
+    }
+    try {
+      const hex = await extractDominantColor(currentTrack.coverUrl);
+      if (hex) {
+        setLocalCustomHex(hex);
+        updateSettings({
+          accentColor: 'custom',
+          customAccentHex: hex
+        });
+        showToast(t('albumColorExtracted') + ` (${hex})`, 'success');
+      } else {
+        showToast(t('noAlbumArtFound'), 'info');
+      }
+    } catch {
+      showToast(t('noAlbumArtFound'), 'info');
+    }
+  }, [currentTrack?.coverUrl, t, updateSettings, showToast]);
+
+  useEffect(() => {
+    if (!settings.autoAlbumTheme || !currentTrack?.coverUrl) return;
+    let cancelled = false;
+    extractDominantColor(currentTrack.coverUrl).then((hex) => {
+      if (!cancelled && hex) {
+        setLocalCustomHex(hex);
+        updateSettings({
+          accentColor: 'custom',
+          customAccentHex: hex
+        });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrack?.coverUrl, settings.autoAlbumTheme, updateSettings]);
 
   return (
     <div
-      className="min-h-screen lg:h-screen w-full bg-[#07080c] text-zinc-100 flex flex-col font-sans select-none overflow-x-hidden lg:overflow-hidden relative"
+      className="aurelia-app-root min-h-screen lg:h-screen w-full bg-[#07080c] text-zinc-100 flex flex-col font-sans select-none overflow-x-hidden lg:overflow-hidden relative"
       onDragOver={(e) => {
         e.preventDefault();
         setIsDraggingOver(true);
@@ -4276,7 +4531,7 @@ export default function App() {
             className="absolute inset-0 w-full h-full object-cover scale-125 blur-[95px] opacity-30 transition-all duration-1000 ease-out"
           />
         )}
-        <div className="absolute inset-0 bg-gradient-to-b from-[#07080c]/80 via-[#07080c]/88 to-[#07080c]/98" />
+        <div className="absolute inset-0 aurelia-backdrop-overlay bg-gradient-to-b from-[#07080c]/80 via-[#07080c]/88 to-[#07080c]/98" />
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_25%_20%,rgba(245,158,11,0.09),transparent_55%),radial-gradient(circle_at_80%_75%,rgba(56,189,248,0.08),transparent_55%)]" />
         {settings.ambientGlow && (
           <>
@@ -4338,22 +4593,18 @@ export default function App() {
         </div>
       )}
 
-      <header className="relative z-10 shrink-0 border-b border-white/[0.07] bg-zinc-950/50 backdrop-blur-xl">
+      <header className="aurelia-glass-header relative z-40 shrink-0 border-b border-white/[0.07] bg-zinc-950/50 backdrop-blur-xl">
         {/* Title bar: brand, now-playing capsule and quick actions */}
         <div
           data-tauri-drag-region
           style={DRAG_STYLE}
           onDoubleClick={handleTitleBarDoubleClick}
-          className="pywebview-drag-region relative flex items-center justify-between gap-3 px-4 lg:px-8 h-12 overflow-hidden select-none md:grid md:grid-cols-[1fr_minmax(0,30rem)_1fr] bg-gradient-to-r from-amber-500/[0.07] via-transparent to-amber-500/[0.07] border-b border-white/[0.05]"
+          className="pywebview-drag-region relative flex items-center justify-between gap-3 px-4 lg:px-8 h-10 overflow-hidden select-none md:grid md:grid-cols-[auto_minmax(0,28rem)_auto] bg-gradient-to-r from-amber-500/[0.05] via-transparent to-amber-500/[0.05] border-b border-white/[0.05]"
         >
-          {/* Brand */}
-          <div className="pointer-events-none flex items-center gap-2.5 min-w-0">
-            <div className="w-8 h-8 shrink-0 rounded-xl bg-gradient-to-br from-amber-400 via-amber-500 to-amber-700 flex items-center justify-center shadow-md shadow-amber-500/20">
-              <Disc className={`w-4 h-4 text-zinc-950 ${isPlaying ? 'animate-spin' : ''}`} style={{ animationDuration: '6s' }} />
-            </div>
-            <div className="flex flex-col justify-center leading-none min-w-0">
-              <span className="text-sm sm:text-base font-semibold tracking-[0.3em] text-white">AURELIA</span>
-              <span className="hidden sm:block mt-1 text-[9px] uppercase tracking-[0.28em] text-amber-300/60">Audiophile Player</span>
+          {/* Brand Logo Only */}
+          <div className="pointer-events-none flex items-center min-w-0">
+            <div className="w-7 h-7 shrink-0 rounded-xl bg-gradient-to-br from-amber-400 via-amber-500 to-amber-700 flex items-center justify-center shadow-md shadow-amber-500/20">
+              <Disc className={`w-3.5 h-3.5 text-zinc-950 ${isPlaying ? 'animate-spin' : ''}`} style={{ animationDuration: '6s' }} />
             </div>
           </div>
 
@@ -4362,23 +4613,24 @@ export default function App() {
             {currentTrack ? currentTrack.title : ''}
           </span>
           <div className="pointer-events-none hidden md:flex items-center justify-center min-w-0">
-            <div className="flex items-center gap-3 max-w-full min-w-0 px-4 py-1.5 rounded-full bg-black/30 border border-white/10 shadow-inner shadow-black/40">
+            <div className="flex items-center gap-3 max-w-full min-w-0 px-4 py-1 rounded-full bg-black/30 border border-white/10 shadow-inner shadow-black/40">
               <span className="flex items-end gap-[3px] h-3.5 shrink-0" aria-hidden="true">
                 {[0, 1, 2, 3].map((i) => (
                   <span
                     key={i}
-                    className={`w-[3px] h-full rounded-full origin-bottom ${currentTrack ? 'bg-amber-400' : 'bg-zinc-600'}`}
-                    style={
-                      isPlaying
+                    className={`w-[3px] h-full rounded-full origin-bottom ${currentTrack ? '' : 'bg-zinc-600'}`}
+                    style={{
+                      backgroundColor: currentTrack ? activePalette.hex400 : undefined,
+                      ...(isPlaying
                         ? { animation: `aurelia-eq ${0.8 + i * 0.13}s ease-in-out ${i * 0.1}s infinite` }
-                        : { transform: 'scaleY(0.3)' }
-                    }
+                        : { transform: 'scaleY(0.3)' })
+                    }}
                   />
                 ))}
               </span>
               <div className="min-w-0 flex items-baseline gap-2">
                 <span className={`truncate text-xs font-semibold ${currentTrack ? 'text-zinc-100' : 'text-zinc-500'}`}>
-                  {currentTrack ? currentTrack.title : 'Nothing playing'}
+                  {currentTrack ? currentTrack.title : t('nothingPlaying')}
                 </span>
                 {currentTrack?.artist && (
                   <span className="truncate text-[11px] text-zinc-400">{currentTrack.artist}</span>
@@ -4387,22 +4639,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* Quick actions */}
-          <div className="pointer-events-none flex items-center justify-end gap-2 shrink-0 md:shrink self-stretch">
-            <span className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/[0.04] border border-white/[0.08] text-[11px] font-mono text-zinc-400">
-              <ListMusic className="w-3 h-3 text-amber-400" />
-              {tracks.length} {tracks.length === 1 ? 'track' : 'tracks'}
-            </span>
-            <button
-              onClick={(e) => toggleFullscreenMode('player', e.currentTarget)}
-              style={NO_DRAG_STYLE}
-              className="pointer-events-auto p-2 rounded-xl bg-white/[0.04] hover:bg-white/10 border border-white/[0.08] text-zinc-300 hover:text-white transition"
-              title="Fullscreen player"
-              aria-label="Fullscreen player"
-            >
-              <Maximize2 className="w-3.5 h-3.5" />
-            </button>
-
+          {/* Quick actions & Window controls */}
+          <div className="pointer-events-none flex items-center justify-end shrink-0 md:shrink self-stretch">
             {showWindowControls && (
               <div
                 style={NO_DRAG_STYLE}
@@ -4452,8 +4690,12 @@ export default function App() {
           {/* Playback progress hairline along the bottom edge */}
           <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[2px] bg-white/[0.04]">
             <div
-              className="h-full bg-gradient-to-r from-amber-600 via-amber-400 to-amber-200 shadow-[0_0_8px_rgba(251,191,36,0.6)] transition-[width] duration-300 ease-linear"
-              style={{ width: `${duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0}%` }}
+              className="h-full transition-[width] duration-300 ease-linear"
+              style={{
+                width: `${duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0}%`,
+                background: `linear-gradient(to right, ${activePalette.hex600}, ${activePalette.hex400}, ${activePalette.hex200})`,
+                boxShadow: `0 0 8px ${activePalette.hex400}80`
+              }}
             />
           </div>
         </div>
@@ -4462,9 +4704,9 @@ export default function App() {
         <div className="px-4 lg:px-8 py-2 flex flex-wrap items-center justify-between gap-3">
           <nav className="flex items-center gap-1 bg-white/[0.03] p-1 rounded-xl border border-white/[0.07] overflow-x-auto max-w-full no-scrollbar">
             {[
-              { id: 'library', label: 'Library', icon: Music },
-              { id: 'insights', label: 'Signals', icon: Activity },
-              { id: 'settings', label: 'Settings', icon: Settings }
+              { id: 'library', label: t('library'), icon: Music },
+              { id: 'insights', label: t('signals'), icon: Activity },
+              { id: 'settings', label: t('settings'), icon: Settings }
             ].map((item) => {
               const Icon = item.icon;
               const active = activeTab === item.id;
@@ -4473,8 +4715,8 @@ export default function App() {
                   key={item.id}
                   onClick={() => setActiveTab(item.id)}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all whitespace-nowrap ${active
-                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
+                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
                     }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
@@ -4485,22 +4727,94 @@ export default function App() {
           </nav>
 
           <div className="flex items-center gap-2">
+            {/* Quick Dark / Light Mode Toggle */}
+            <button
+              onClick={() => updateSetting('themeMode', settings.themeMode === 'light' ? 'dark' : 'light')}
+              className="p-2 rounded-xl border border-white/10 bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 hover:text-white transition"
+              title={settings.themeMode === 'light' ? t('darkMode') : t('lightMode')}
+              aria-label={settings.themeMode === 'light' ? t('darkMode') : t('lightMode')}
+            >
+              {settings.themeMode === 'light' ? (
+                <Moon className="w-3.5 h-3.5" />
+              ) : (
+                <Sun className="w-3.5 h-3.5" />
+              )}
+            </button>
+
+            {/* Quick Color Picker Trigger & Dropdown Popover */}
+            <div className="relative" ref={colorPickerRef}>
+              <button
+                onClick={() => setShowColorPickerPopover((prev) => !prev)}
+                className={`p-2 rounded-xl border transition flex items-center justify-center gap-1.5 ${
+                  showColorPickerPopover
+                    ? 'bg-white/10 border-white/20 text-white shadow-sm'
+                    : 'bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 border-white/10'
+                }`}
+                title={t('accentColorQuick')}
+                aria-label={t('accentColorQuick')}
+              >
+                <span
+                  className="w-3.5 h-3.5 rounded-full ring-2 ring-white/20 shadow-sm transition-transform hover:scale-110 shrink-0"
+                  style={{ backgroundColor: activePalette.swatch }}
+                />
+                <ChevronDown className={`w-3 h-3 text-zinc-400 transition-transform duration-200 ${showColorPickerPopover ? 'rotate-180 text-white' : ''}`} />
+              </button>
+
+              {showColorPickerPopover && (
+                <div className="absolute right-0 top-full mt-2.5 z-50 p-2 rounded-2xl bg-zinc-950/90 border border-white/10 shadow-2xl backdrop-blur-2xl flex items-center gap-1.5 animate-in fade-in zoom-in-95 duration-150">
+                  {/* Preset Color Dots */}
+                  {Object.values(ACCENT_PALETTES).map((pal) => {
+                    const isSelected = settings.accentColor === pal.id;
+                    return (
+                      <button
+                        key={pal.id}
+                        onClick={() => updateSetting('accentColor', pal.id)}
+                        className={`w-5 h-5 rounded-full transition-all flex items-center justify-center shrink-0 ${
+                          isSelected
+                            ? 'ring-2 ring-white ring-offset-2 ring-offset-zinc-950 scale-110'
+                            : 'opacity-70 hover:opacity-100 hover:scale-110'
+                        }`}
+                        style={{ backgroundColor: pal.swatch }}
+                        title={pal.label}
+                      />
+                    );
+                  })}
+
+                  <div className="w-[1px] h-4 bg-white/15 mx-0.5" />
+
+                  {/* Extract from Album Art Button */}
+                  <button
+                    onClick={() => {
+                      handleExtractAlbumColor();
+                      setShowColorPickerPopover(false);
+                    }}
+                    className={`p-1 rounded-lg transition-all flex items-center justify-center shrink-0 ${
+                      currentTrack?.coverUrl ? 'hover:scale-110 text-amber-300 hover:bg-white/10' : 'opacity-40 text-zinc-500 cursor-not-allowed'
+                    }`}
+                    title={t('colorFromAlbum')}
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+            </div>
+
             <button
               onClick={() => fileInputRef.current?.click()}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-xs transition shadow-md shadow-amber-500/15"
-              title="Import Audio Files"
+              title={t('importAudioFiles')}
             >
               <Upload className="w-3.5 h-3.5" />
-              <span>Import</span>
+              <span>{t('importFiles')}</span>
             </button>
             <button
               onClick={() => handleSelectOrRestoreFolder(null)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/[0.05] hover:bg-white/10 text-zinc-200 border border-white/10 text-xs font-medium transition"
-              title={rememberedFolder.name ? `Music Folder: ${rememberedFolder.name}` : 'Select Music Folder'}
+              title={rememberedFolder.name ? `${t('musicFolder')}: ${rememberedFolder.name}` : t('selectMusicFolder')}
             >
               <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
               <span className="hidden md:inline max-w-[140px] truncate">
-                {rememberedFolder.name || 'Folder'}
+                {rememberedFolder.name || t('musicFolder')}
               </span>
             </button>
           </div>
@@ -4511,7 +4825,7 @@ export default function App() {
       <main className="relative z-10 flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-4 px-4 lg:px-8 pt-3 pb-4 max-w-[1720px] w-full mx-auto overflow-hidden">
         {/* Left Column: Unified Audio Stream & Now Playing Centerpiece */}
         <section className="lg:col-span-5 min-h-0 flex flex-col">
-          <div className="flex-1 min-h-0 rounded-3xl border border-white/10 shadow-2xl flex flex-col justify-between p-4 sm:p-5 relative overflow-hidden bg-zinc-950">
+          <div className="aurelia-glass-panel aurelia-player-centerpiece flex-1 min-h-0 rounded-3xl border border-white/10 shadow-2xl flex flex-col justify-between p-4 sm:p-5 relative overflow-hidden bg-zinc-950">
             {/* Dynamic Crossfading Album Artwork Ambient Background */}
             <div className="pointer-events-none absolute inset-0 overflow-hidden z-0">
               {backdropState.prevUrl && (
@@ -4529,14 +4843,14 @@ export default function App() {
                   className="absolute inset-0 w-full h-full object-cover object-center scale-110 blur-2xl opacity-55 transition-all duration-700 ease-out"
                 />
               )}
-              <div className="absolute inset-0 bg-gradient-to-b from-black/45 via-black/65 to-[#07080c]/95" />
-              <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_26%,transparent_15%,rgba(7,8,12,0.82)_100%)]" />
+              <div className="absolute inset-0 aurelia-centerpiece-overlay bg-gradient-to-b from-black/45 via-black/65 to-[#07080c]/95" />
+              <div className="absolute inset-0 aurelia-centerpiece-radial bg-[radial-gradient(circle_at_50%_26%,transparent_15%,rgba(7,8,12,0.82)_100%)]" />
             </div>
 
             {/* Top Bar: Audio Stream Spec, Queue Toggle & Adjacent Fullscreen Buttons */}
             <div className="relative z-10 flex items-center justify-between gap-2 shrink-0">
               <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-300/90 min-w-0">
-                <span className={`w-2 h-2 rounded-full shrink-0 ${isPlaying ? 'bg-amber-400 animate-pulse' : 'bg-zinc-500'}`} />
+                <span className={`w-2 h-2 rounded-full shrink-0 ${isPlaying ? 'animate-pulse' : 'bg-zinc-500'}`} style={{ backgroundColor: isPlaying ? activePalette.hex400 : undefined }} />
                 <span className="truncate">{currentTrack?.codec?.split(' ')[0] || 'PCM'}</span>
                 {currentTrack?.sampleRate && (
                   <span className="text-zinc-400 shrink-0">
@@ -4550,8 +4864,8 @@ export default function App() {
                 <button
                   onClick={() => setShowQueueDrawer((q) => !q)}
                   className={`px-2 py-1.5 rounded-xl border text-xs font-medium flex items-center gap-1 transition ${showQueueDrawer
-                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
-                      : 'bg-black/35 hover:bg-black/60 border-white/10 text-zinc-300 hover:text-white'
+                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                    : 'bg-black/35 hover:bg-black/60 border-white/10 text-zinc-300 hover:text-white'
                     }`}
                   title={`Playback Queue (${queue.length})`}
                   aria-label="Toggle Playback Queue"
@@ -4685,7 +4999,7 @@ export default function App() {
 
               {/* Seek / Progress Bar */}
               <div className="flex items-center gap-2.5 pt-1 border-t border-white/10">
-                <span className="text-[11px] font-mono text-amber-300 w-9 text-right shrink-0">
+                <span className="text-[11px] font-mono w-9 text-right shrink-0" style={{ color: activePalette?.hex300 || '#fcd34d' }}>
                   {formatTime(currentTime)}
                 </span>
                 <input
@@ -4696,7 +5010,8 @@ export default function App() {
                   value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
                   onChange={(e) => handleSeek(parseFloat(e.target.value))}
                   aria-label="Seek timeline"
-                  className="flex-1 h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                  style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
+                  className="flex-1 h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer"
                 />
                 <span className="text-[11px] font-mono text-zinc-400 w-9 shrink-0">
                   {formatTime(duration || currentTrack?.duration || 0)}
@@ -4718,8 +5033,8 @@ export default function App() {
                   <button
                     onClick={() => setRepeatMode((r) => (r === 'off' ? 'all' : r === 'all' ? 'one' : 'off'))}
                     className={`p-1.5 rounded-xl transition ${repeatMode !== 'off'
-                        ? 'text-amber-400 bg-amber-500/15'
-                        : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                      ? 'text-amber-400 bg-amber-500/15'
+                      : 'text-zinc-400 hover:text-white hover:bg-white/5'
                       }`}
                     title={`Repeat: ${repeatMode.toUpperCase()} (R)`}
                     aria-label="Repeat"
@@ -4807,8 +5122,8 @@ export default function App() {
                       key={eq.id}
                       onClick={() => updateSetting('eqPreset', eq.id)}
                       className={`px-2 py-0.5 rounded-lg text-[10px] font-medium transition ${settings.eqPreset === eq.id
-                          ? 'bg-amber-500/25 text-amber-300 border border-amber-400/30'
-                          : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                        ? 'bg-amber-500/25 text-amber-300 border border-amber-400/30'
+                        : 'text-zinc-400 hover:text-white hover:bg-white/5'
                         }`}
                     >
                       {eq.label}
@@ -4823,50 +5138,56 @@ export default function App() {
         <section className="lg:col-span-7 min-h-0 flex flex-col">
           {/* TAB 1: ALBUM-AWARE MUSIC LIBRARY */}
           {activeTab === 'library' && (
-            <div className="flex-1 min-h-0 rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-4 sm:p-5 shadow-2xl flex flex-col gap-3 overflow-hidden">
-              {/* Compact Folder & Batch Import Bar */}
-              {(rememberedFolder.name || importProgress) && (
+            <div className="aurelia-glass-panel flex-1 min-h-0 rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-4 sm:p-5 shadow-2xl flex flex-col gap-3 overflow-hidden">
+              {/* Folder & Library Management Bar */}
+              {(rememberedFolder.name || tracks.length > 0 || importProgress) && (
                 <div className="px-3 py-2 rounded-2xl bg-zinc-950/70 border border-white/[0.07] flex flex-col gap-2 shrink-0">
-                  {rememberedFolder.name && (
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <HardDrive className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                        <span className="text-xs font-medium text-zinc-200 truncate">
-                          {rememberedFolder.name}
-                        </span>
-                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-zinc-400">
-                          {groupedAlbums.length} albums
-                        </span>
-                      </div>
-
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {rememberedFolder.handle && rememberedFolder.permissionState !== 'granted' && (
-                          <button
-                            onClick={() => handleSelectOrRestoreFolder(rememberedFolder.handle)}
-                            className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-xs transition"
-                          >
-                            Restore
-                          </button>
-                        )}
-                        {rememberedFolder.handle && rememberedFolder.permissionState === 'granted' && (
-                          <button
-                            onClick={() => handleSelectOrRestoreFolder(rememberedFolder.handle)}
-                            className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-300 text-xs flex items-center gap-1"
-                            title="Rescan Folder"
-                          >
-                            <RefreshCw className="w-3 h-3 text-amber-400" />
-                            <span>Rescan</span>
-                          </button>
-                        )}
-                        <button
-                          onClick={() => handleSelectOrRestoreFolder(null)}
-                          className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-zinc-400 hover:text-zinc-200"
-                        >
-                          Change
-                        </button>
-                      </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <FolderOpen className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <span className="text-xs font-medium text-zinc-200 truncate">
+                        {rememberedFolder.name || t('library')}
+                      </span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-zinc-400">
+                        {groupedAlbums.length} albums • {tracks.length} tracks
+                      </span>
                     </div>
-                  )}
+
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        onClick={handleSelectOrRestoreFolder}
+                        className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-200 text-xs flex items-center gap-1.5 transition"
+                        title={t('rescanFolder')}
+                      >
+                        <RefreshCw className="w-3 h-3 text-amber-400" />
+                        <span>{t('rescan')}</span>
+                      </button>
+                      <button
+                        onClick={handleFindAndRemoveDuplicates}
+                        className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-1.5 transition"
+                        title={t('removeDuplicates')}
+                      >
+                        <Sparkles className="w-3 h-3 text-amber-400" />
+                        <span>{t('cleanDuplicates')}</span>
+                      </button>
+                      <button
+                        onClick={handleSelectOrRestoreFolder}
+                        className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-zinc-400 hover:text-zinc-200"
+                        title={t('selectMusicFolder')}
+                      >
+                        {t('change')}
+                      </button>
+                      {rememberedFolder.name && (
+                        <button
+                          onClick={handleForgetRememberedFolder}
+                          className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-rose-400/80 hover:text-rose-300"
+                          title={t('forget')}
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
 
                   {importProgress && (
                     <div className="flex flex-col gap-1">
@@ -4908,8 +5229,8 @@ export default function App() {
                     <button
                       onClick={() => setLibraryViewMode('albums')}
                       className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition ${libraryViewMode === 'albums'
-                          ? 'bg-amber-500 text-zinc-950 font-semibold'
-                          : 'text-zinc-400 hover:text-white'
+                        ? 'bg-amber-500 text-zinc-950 font-semibold'
+                        : 'text-zinc-400 hover:text-white'
                         }`}
                     >
                       <LayoutGrid className="w-3.5 h-3.5" />
@@ -4918,8 +5239,8 @@ export default function App() {
                     <button
                       onClick={() => setLibraryViewMode('tracks')}
                       className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition ${libraryViewMode === 'tracks'
-                          ? 'bg-amber-500 text-zinc-950 font-semibold'
-                          : 'text-zinc-400 hover:text-white'
+                        ? 'bg-amber-500 text-zinc-950 font-semibold'
+                        : 'text-zinc-400 hover:text-white'
                         }`}
                     >
                       <List className="w-3.5 h-3.5" />
@@ -4982,8 +5303,8 @@ export default function App() {
                   <button
                     onClick={() => setSelectedPlaylistId('ALL')}
                     className={`px-2.5 py-1 rounded-lg text-xs font-medium transition whitespace-nowrap ${selectedPlaylistId === 'ALL'
-                        ? 'bg-white/15 text-white'
-                        : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
+                      ? 'bg-white/15 text-white'
+                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
                       }`}
                   >
                     All
@@ -4993,8 +5314,8 @@ export default function App() {
                       key={pl.id}
                       onClick={() => setSelectedPlaylistId(pl.id)}
                       className={`px-2.5 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1.5 whitespace-nowrap ${selectedPlaylistId === pl.id
-                          ? 'bg-white/15 text-amber-300'
-                          : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
+                        ? 'bg-white/15 text-amber-300'
+                        : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
                         }`}
                     >
                       <span>{pl.name}</span>
@@ -5071,8 +5392,8 @@ export default function App() {
                               key={album.id}
                               onClick={() => setSelectedAlbumId(album.id)}
                               className={`group rounded-2xl p-2 border transition-all cursor-pointer flex flex-col justify-between ${isSelected
-                                  ? 'bg-white/[0.08] border-amber-500/45 shadow-md'
-                                  : 'bg-zinc-950/45 hover:bg-white/[0.04] border-white/[0.06]'
+                                ? 'bg-white/[0.08] border-amber-500/45 shadow-md'
+                                : 'bg-zinc-950/45 hover:bg-white/[0.04] border-white/[0.06]'
                                 }`}
                             >
                               <div>
@@ -5162,10 +5483,17 @@ export default function App() {
                               </button>
                               <button
                                 onClick={() => handleQueueAlbum(activeSelectedAlbum)}
-                                className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-300 text-xs font-medium"
+                                className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-300 text-xs font-medium"
                                 title="Queue Album"
                               >
                                 +Queue
+                              </button>
+                              <button
+                                onClick={() => handleDeleteAlbum(activeSelectedAlbum)}
+                                className="p-2 rounded-xl bg-white/5 hover:bg-rose-500/20 border border-white/10 text-zinc-400 hover:text-rose-400 transition"
+                                title={t('deleteAlbum')}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
                               </button>
                             </div>
                           </div>
@@ -5181,8 +5509,8 @@ export default function App() {
                                   key={track.id}
                                   onClick={() => handlePlayAlbum(activeSelectedAlbum, track.id)}
                                   className={`group flex items-center justify-between gap-2 py-2 px-2 rounded-xl transition cursor-pointer ${isCurrent
-                                      ? 'bg-amber-500/15 text-amber-300'
-                                      : 'hover:bg-white/[0.04] text-zinc-200'
+                                    ? 'bg-amber-500/15 text-amber-300'
+                                    : 'hover:bg-white/[0.04] text-zinc-200'
                                     }`}
                                 >
                                   <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -5227,6 +5555,13 @@ export default function App() {
                                     >
                                       +Q
                                     </button>
+                                    <button
+                                      onClick={() => handleDeleteTrack(track.id)}
+                                      className="p-1 rounded-lg text-zinc-500 opacity-0 group-hover:opacity-100 hover:text-rose-400 transition"
+                                      title={t('deleteTrack')}
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
                                   </div>
                                 </div>
                               );
@@ -5266,8 +5601,8 @@ export default function App() {
                             else togglePlayPause();
                           }}
                           className={`group flex items-center justify-between gap-3 p-2 rounded-xl transition cursor-pointer shrink-0 ${isCurrent
-                              ? 'bg-amber-500/15 text-amber-300'
-                              : 'hover:bg-white/[0.04]'
+                            ? 'bg-amber-500/15 text-amber-300'
+                            : 'hover:bg-white/[0.04]'
                             }`}
                         >
                           <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -5320,6 +5655,13 @@ export default function App() {
                             >
                               +Q
                             </button>
+                            <button
+                              onClick={() => handleDeleteTrack(track.id)}
+                              className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 transition"
+                              title={t('deleteTrack')}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
                           </div>
                         </div>
                       );
@@ -5332,7 +5674,7 @@ export default function App() {
 
           {/* TAB 2: SIGNALS — AUDIO ANALYSIS & MUSIC METADATA */}
           {activeTab === 'insights' && (
-            <div className="flex-1 min-h-0 overflow-y-auto aurelia-scrollbar rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-4 sm:p-5 shadow-2xl flex flex-col gap-5">
+            <div className="aurelia-glass-panel flex-1 min-h-0 overflow-y-auto aurelia-scrollbar rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-4 sm:p-5 shadow-2xl flex flex-col gap-5">
               {!currentTrack ? (
                 <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
                   <Activity className="w-8 h-8 text-zinc-600 mb-2" />
@@ -5377,38 +5719,28 @@ export default function App() {
                         {[
                           {
                             label: 'Sample Peak',
-                            value: `${currentTrack.dspAnalysis.peakDb} dBFS`,
-                            badge: 'MEASURED PCM'
+                            value: `${currentTrack.dspAnalysis.peakDb} dBFS`
                           },
                           {
                             label: 'RMS Loudness',
-                            value: `${currentTrack.dspAnalysis.rmsDb} dBFS`,
-                            badge: 'MEASURED PCM'
+                            value: `${currentTrack.dspAnalysis.rmsDb} dBFS`
                           },
                           {
                             label: 'Crest Factor',
                             value: `${currentTrack.dspAnalysis.crestFactorDb} dB`,
-                            badge: 'DYNAMIC RANGE',
                             highlight: true
                           },
                           {
                             label: 'Phase Correlation',
-                            value: `${currentTrack.dspAnalysis.stereoCorrelation}`,
-                            badge: 'STEREO STAGE'
+                            value: `${currentTrack.dspAnalysis.stereoCorrelation}`
                           },
                           {
                             label: 'Clipping Count',
-                            value: `${currentTrack.dspAnalysis.clippedSamples}`,
-                            badge: currentTrack.dspAnalysis.clippedSamples === 0 ? 'CLEAN' : 'CLIPPED'
+                            value: `${currentTrack.dspAnalysis.clippedSamples}`
                           }
                         ].map((m, idx) => (
                           <div key={idx} className="p-3 rounded-2xl bg-zinc-950/65 border border-white/[0.06] flex flex-col justify-between">
-                            <div className="flex items-center justify-between gap-1">
-                              <span className="text-[11px] text-zinc-400">{m.label}</span>
-                              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-zinc-400">
-                                {m.badge}
-                              </span>
-                            </div>
+                            <span className="text-[11px] text-zinc-400">{m.label}</span>
                             <div
                               className={`text-sm sm:text-base font-mono font-semibold mt-1.5 ${m.highlight ? 'text-amber-300' : 'text-white'
                                 }`}
@@ -5425,8 +5757,7 @@ export default function App() {
                       {[
                         {
                           label: 'Codec',
-                          value: currentTrack.codec || 'N/A',
-                          badge: currentTrack.containerSource?.includes('Binary') ? 'HEADER VERIFIED' : 'EXTENSION'
+                          value: currentTrack.codec || 'N/A'
                         },
                         {
                           label: 'Sample Rate',
@@ -5434,41 +5765,31 @@ export default function App() {
                             ? `${currentTrack.sampleRate.toLocaleString()} Hz`
                             : currentTrack.dspAnalysis?.sampleRate
                               ? `${currentTrack.dspAnalysis.sampleRate.toLocaleString()} Hz`
-                              : 'N/A',
-                          badge: currentTrack.sampleRate ? 'HEADER VERIFIED' : 'WEB AUDIO'
+                              : 'N/A'
                         },
                         {
                           label: 'Bit Depth',
-                          value: currentTrack.bitDepth ? `${currentTrack.bitDepth}-Bit PCM` : '32-Bit Float',
-                          badge: currentTrack.bitDepth ? 'HEADER VERIFIED' : 'DECODED FLOAT'
+                          value: currentTrack.bitDepth ? `${currentTrack.bitDepth}-Bit PCM` : '32-Bit Float'
                         },
                         {
                           label: 'Bitrate',
                           value: currentTrack.dspAnalysis?.estimatedBitrateKbps
                             ? `~${currentTrack.dspAnalysis.estimatedBitrateKbps} kbps`
-                            : 'Unavailable',
-                          badge: 'ESTIMATED'
+                            : 'Unavailable'
                         },
                         {
                           label: 'Channels',
-                          value: `${currentTrack.channels || currentTrack.dspAnalysis?.channels || 2} Ch`,
-                          badge: currentTrack.channels ? 'HEADER VERIFIED' : 'DECODED'
+                          value: `${currentTrack.channels || currentTrack.dspAnalysis?.channels || 2} Ch`
                         },
                         {
                           label: 'PCM Duration',
                           value: currentTrack.dspAnalysis?.duration
                             ? `${currentTrack.dspAnalysis.duration.toFixed(2)}s`
-                            : formatTime(currentTrack.duration || 0),
-                          badge: currentTrack.dspAnalysis?.duration ? 'MEASURED PCM' : 'METADATA'
+                            : formatTime(currentTrack.duration || 0)
                         }
                       ].map((card, i) => (
                         <div key={i} className="p-2.5 rounded-2xl bg-zinc-950/50 border border-white/[0.05]">
-                          <div className="flex items-center justify-between gap-1">
-                            <span className="text-[10px] text-zinc-400">{card.label}</span>
-                            <span className="text-[8px] font-mono px-1 py-0.5 rounded bg-white/5 text-zinc-500">
-                              {card.badge}
-                            </span>
-                          </div>
+                          <span className="text-[10px] text-zinc-400 block">{card.label}</span>
                           <div className="text-xs font-semibold text-zinc-100 mt-1 font-mono truncate" title={String(card.value)}>
                             {card.value}
                           </div>
@@ -5481,7 +5802,7 @@ export default function App() {
                       <div className="p-3.5 rounded-2xl bg-zinc-950/60 border border-white/[0.06]">
                         <div className="flex items-center justify-between mb-2">
                           <span className="text-xs font-medium text-zinc-300 flex items-center gap-1.5">
-                            <BarChart2 className="w-3.5 h-3.5 text-amber-400" />
+                            <BarChart2 className="w-3.5 h-3.5" style={{ color: activePalette?.hex400 || '#fbbf24' }} />
                             PCM Envelope
                           </span>
                           <span className="text-[10px] font-mono text-zinc-400">
@@ -5508,9 +5829,13 @@ export default function App() {
                             return (
                               <div key={idx} className="flex-1 h-full flex items-center justify-center">
                                 <div
-                                  style={{ height: `${hPct}%` }}
-                                  className={`w-full rounded-full transition-colors ${passed ? 'bg-amber-400' : 'bg-white/15 hover:bg-white/35'
-                                    }`}
+                                  style={{
+                                    height: `${hPct}%`,
+                                    backgroundColor: passed ? (activePalette?.hex400 || '#fbbf24') : undefined
+                                  }}
+                                  className={`w-full rounded-full transition-colors ${
+                                    passed ? '' : 'bg-white/15 hover:bg-white/35'
+                                  }`}
                                 />
                               </div>
                             );
@@ -5534,18 +5859,6 @@ export default function App() {
                             <span>{metadataLookupState.message}</span>
                           </span>
                         )}
-                        {metadataLookupState.status === 'enriched' && (
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300">
-                            {metadataLookupState.message}
-                          </span>
-                        )}
-                        {(metadataLookupState.status === 'no-match' ||
-                          metadataLookupState.status === 'offline' ||
-                          metadataLookupState.status === 'error') && (
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-white/5 text-zinc-400">
-                              {metadataLookupState.message}
-                            </span>
-                          )}
                       </div>
 
                       <div className="flex items-center gap-2">
@@ -5573,43 +5886,31 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Dynamic Non-Empty Metadata Grid with Explicit Source Provenance */}
+                    {/* Dynamic Non-Empty Metadata Grid */}
                     {(() => {
-                      const src = currentTrack.fieldSources || {};
-                      const formatBadge = (key) => {
-                        const s = src[key];
-                        if (s === 'Embedded') return { text: 'EMBEDDED TAG', cls: 'bg-emerald-500/15 text-emerald-300' };
-                        if (s === 'MusicBrainz') return { text: 'MUSICBRAINZ', cls: 'bg-sky-500/15 text-sky-300' };
-                        return { text: 'INFERRED', cls: 'bg-white/5 text-zinc-400' };
-                      };
-
                       const identityItems = [];
                       if (currentTrack.title) {
                         identityItems.push({
                           label: 'Track Title',
-                          value: currentTrack.title,
-                          badge: formatBadge('title')
+                          value: currentTrack.title
                         });
                       }
                       if (currentTrack.artist && currentTrack.artist !== 'Unknown Artist') {
                         identityItems.push({
                           label: 'Artist',
-                          value: currentTrack.artist,
-                          badge: formatBadge('artist')
+                          value: currentTrack.artist
                         });
                       }
                       if (Array.isArray(currentTrack.contributingArtists) && currentTrack.contributingArtists.length > 0) {
                         identityItems.push({
                           label: 'Contributing Artists',
-                          value: currentTrack.contributingArtists.join(', '),
-                          badge: formatBadge('contributingArtists')
+                          value: currentTrack.contributingArtists.join(', ')
                         });
                       }
                       if (currentTrack.duration > 0 || currentTrack.dspAnalysis?.duration > 0) {
                         identityItems.push({
                           label: 'Duration',
-                          value: formatTime(currentTrack.dspAnalysis?.duration || currentTrack.duration),
-                          badge: { text: 'VERIFIED', cls: 'bg-emerald-500/15 text-emerald-300' }
+                          value: formatTime(currentTrack.dspAnalysis?.duration || currentTrack.duration)
                         });
                       }
 
@@ -5621,8 +5922,7 @@ export default function App() {
                       ) {
                         releaseItems.push({
                           label: 'Album Title',
-                          value: currentTrack.album,
-                          badge: formatBadge('album')
+                          value: currentTrack.album
                         });
                       }
                       if (
@@ -5631,8 +5931,7 @@ export default function App() {
                       ) {
                         releaseItems.push({
                           label: 'Album Artist',
-                          value: currentTrack.albumArtist,
-                          badge: formatBadge('albumArtist')
+                          value: currentTrack.albumArtist
                         });
                       }
                       if (currentTrack.releaseDate || currentTrack.year) {
@@ -5641,8 +5940,7 @@ export default function App() {
                           value:
                             currentTrack.releaseDate && currentTrack.year && currentTrack.releaseDate !== currentTrack.year
                               ? `${currentTrack.releaseDate} (${currentTrack.year})`
-                              : currentTrack.releaseDate || currentTrack.year,
-                          badge: formatBadge(currentTrack.releaseDate ? 'releaseDate' : 'year')
+                              : currentTrack.releaseDate || currentTrack.year
                         });
                       }
                       if (
@@ -5655,8 +5953,7 @@ export default function App() {
                             : [currentTrack.genre];
                         releaseItems.push({
                           label: gList.length > 1 ? 'Primary & Additional Genres' : 'Genre',
-                          value: gList.join(' • '),
-                          badge: formatBadge('genre')
+                          value: gList.join(' • ')
                         });
                       }
                       if (currentTrack.trackNumber) {
@@ -5670,8 +5967,7 @@ export default function App() {
                           : '';
                         releaseItems.push({
                           label: 'Track / Disc Position',
-                          value: `${trkStr}${discStr}`,
-                          badge: formatBadge('trackNumber')
+                          value: `${trkStr}${discStr}`
                         });
                       }
                       if (currentTrack.label) {
@@ -5679,15 +5975,13 @@ export default function App() {
                           label: 'Label / Publisher',
                           value: currentTrack.catalogNumber
                             ? `${currentTrack.label} (${currentTrack.catalogNumber})`
-                            : currentTrack.label,
-                          badge: formatBadge('label')
+                            : currentTrack.label
                         });
                       }
                       if (currentTrack.releaseCountry) {
                         releaseItems.push({
                           label: 'Release Country',
-                          value: currentTrack.releaseCountry,
-                          badge: formatBadge('releaseCountry')
+                          value: currentTrack.releaseCountry
                         });
                       }
 
@@ -5695,22 +5989,19 @@ export default function App() {
                       if (currentTrack.composer) {
                         creditsItems.push({
                           label: 'Composer',
-                          value: currentTrack.composer,
-                          badge: formatBadge('composer')
+                          value: currentTrack.composer
                         });
                       }
                       if (currentTrack.songwriter) {
                         creditsItems.push({
                           label: 'Songwriter / Lyricist',
-                          value: currentTrack.songwriter,
-                          badge: formatBadge('songwriter')
+                          value: currentTrack.songwriter
                         });
                       }
                       if (currentTrack.isrc) {
                         creditsItems.push({
                           label: 'ISRC',
                           value: currentTrack.isrc,
-                          badge: formatBadge('isrc'),
                           mono: true
                         });
                       }
@@ -5718,11 +6009,7 @@ export default function App() {
                         creditsItems.push({
                           label: 'Release Artwork',
                           value: currentTrack.coverProvenance || 'Verified Release Artwork',
-                          link: currentTrack.releaseArtworkUrl || (currentTrack.coverUrl?.startsWith('http') ? currentTrack.coverUrl : null),
-                          badge:
-                            src.artwork === 'Embedded'
-                              ? { text: 'EMBEDDED TAG', cls: 'bg-emerald-500/15 text-emerald-300' }
-                              : { text: 'ONLINE VERIFIED', cls: 'bg-sky-500/15 text-sky-300' }
+                          link: currentTrack.releaseArtworkUrl || (currentTrack.coverUrl?.startsWith('http') ? currentTrack.coverUrl : null)
                         });
                       }
 
@@ -5749,12 +6036,7 @@ export default function App() {
                                     key={idx}
                                     className="p-2.5 rounded-xl bg-zinc-900/55 border border-white/[0.04] flex flex-col justify-between gap-1"
                                   >
-                                    <div className="flex items-center justify-between gap-1.5">
-                                      <span className="text-[10px] text-zinc-400">{item.label}</span>
-                                      <span className={`text-[8px] font-mono px-1.5 py-0.5 rounded ${item.badge.cls}`}>
-                                        {item.badge.text}
-                                      </span>
-                                    </div>
+                                    <span className="text-[10px] text-zinc-400 block">{item.label}</span>
                                     <div className="flex items-center justify-between gap-2 mt-0.5">
                                       <span
                                         className={`text-xs font-medium text-zinc-100 break-words ${item.mono ? 'font-mono text-amber-300' : ''
@@ -5790,45 +6072,349 @@ export default function App() {
 
           {/* TAB 3: SETTINGS */}
           {activeTab === 'settings' && (
-            <div className="flex-1 min-h-0 overflow-y-auto aurelia-scrollbar rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-5 shadow-2xl flex flex-col gap-4">
+            <div className="aurelia-glass-panel flex-1 min-h-0 overflow-y-auto aurelia-scrollbar rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-5 shadow-2xl flex flex-col gap-4">
               <h2 className="text-base font-semibold text-white flex items-center gap-2 pb-3 border-b border-white/[0.07] shrink-0">
                 <Settings className="w-4 h-4 text-amber-400" />
-                <span>Settings</span>
+                <span>{t('settings')}</span>
               </h2>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="p-4 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2.5">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Library & Automation</h3>
+                {/* Theme & Accent Color Section */}
+                <div className="md:col-span-2 p-4 sm:p-5 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/5">
+                    <div className="flex items-center gap-2">
+                      <div className="w-7 h-7 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center">
+                        <Palette className="w-4 h-4 text-amber-400" />
+                      </div>
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-200">
+                        {t('appearanceAndAccent')}
+                      </h3>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1 rounded-lg bg-white/5 border border-white/10 text-zinc-300">
+                        <span
+                          className="w-2.5 h-2.5 rounded-full ring-1 ring-white/20"
+                          style={{ backgroundColor: activePalette.swatch }}
+                        />
+                        <span>{activePalette.id === 'custom' ? activePalette.swatch : activePalette.label}</span>
+                      </span>
+                    </div>
+                  </div>
 
-                  <div className="flex items-center justify-between py-1">
-                    <span className="text-xs text-zinc-300">Music Folder</span>
+                  {/* Mode & Language Controls */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {/* Theme Mode Selector (Dark / Light) */}
+                    <div className="flex items-center justify-between p-3 rounded-xl bg-zinc-900/50 border border-white/[0.06]">
+                      <div className="flex items-center gap-2">
+                        {settings.themeMode === 'light' ? (
+                          <Sun className="w-4 h-4 text-amber-400" />
+                        ) : (
+                          <Moon className="w-4 h-4 text-amber-400" />
+                        )}
+                        <span className="text-xs font-semibold text-zinc-200">{t('themeMode')}</span>
+                      </div>
+                      <div className="flex items-center gap-1 bg-zinc-950/80 p-1 rounded-xl border border-white/10">
+                        <button
+                          onClick={() => updateSetting('themeMode', 'dark')}
+                          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition ${
+                            settings.themeMode !== 'light'
+                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                              : 'text-zinc-400 hover:text-white'
+                          }`}
+                        >
+                          <Moon className="w-3.5 h-3.5" />
+                          <span>{t('darkMode')}</span>
+                        </button>
+                        <button
+                          onClick={() => updateSetting('themeMode', 'light')}
+                          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition ${
+                            settings.themeMode === 'light'
+                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                              : 'text-zinc-400 hover:text-white'
+                          }`}
+                        >
+                          <Sun className="w-3.5 h-3.5" />
+                          <span>{t('lightMode')}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Language Selector */}
+                    <div className="flex items-center justify-between p-3 rounded-xl bg-zinc-900/50 border border-white/[0.06]">
+                      <div className="flex items-center gap-2">
+                        <Globe className="w-4 h-4 text-amber-400" />
+                        <span className="text-xs font-semibold text-zinc-200">{t('languageSelect')}</span>
+                      </div>
+                      <div className="flex items-center gap-1 bg-zinc-950/80 p-1 rounded-xl border border-white/10">
+                        <button
+                          onClick={() => updateSetting('language', 'vi')}
+                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${
+                            settings.language === 'vi'
+                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                              : 'text-zinc-400 hover:text-white'
+                          }`}
+                        >
+                          Tiếng Việt
+                        </button>
+                        <button
+                          onClick={() => updateSetting('language', 'en')}
+                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${
+                            settings.language === 'en'
+                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                              : 'text-zinc-400 hover:text-white'
+                          }`}
+                        >
+                          English
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Album Cover Theme Sync */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-zinc-900/50 border border-white/[0.06]">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
+                      <div className="flex flex-col min-w-0">
+                        <span className="text-xs font-semibold text-zinc-200 truncate">{t('autoThemeFromAlbum')}</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={handleExtractAlbumColor}
+                        disabled={!currentTrack?.coverUrl}
+                        className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium text-amber-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 transition"
+                        title={t('extractNow')}
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        <span>{t('extractNow')}</span>
+                      </button>
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(settings.autoAlbumTheme)}
+                          onChange={(e) => updateSetting('autoAlbumTheme', e.target.checked)}
+                          className="sr-only peer"
+                        />
+                        <div className="w-9 h-5 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-amber-500" />
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Preset Palettes (from theme.js) */}
+                  <div className="flex flex-col gap-2 pt-1">
+                    <span className="text-xs font-medium text-zinc-300">
+                      {t('presetPalettes')}
+                    </span>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+                      {Object.values(ACCENT_PALETTES).map((pal) => {
+                        const isSelected = settings.accentColor === pal.id;
+                        return (
+                          <button
+                            key={pal.id}
+                            onClick={() => updateSetting('accentColor', pal.id)}
+                            className={`flex flex-col items-center gap-2 p-3 rounded-xl border text-center transition group relative overflow-hidden ${
+                              isSelected
+                                ? 'bg-amber-500/15 border-amber-400/60 shadow-lg shadow-amber-500/15 ring-1 ring-amber-400/30'
+                                : 'bg-zinc-900/50 border-white/[0.06] hover:bg-white/5 hover:border-white/15'
+                            }`}
+                          >
+                            <span
+                              className="w-6 h-6 rounded-full shrink-0 ring-2 ring-white/30 shadow-md transition-transform group-hover:scale-110 flex items-center justify-center"
+                              style={{ backgroundColor: pal.swatch }}
+                            >
+                              {isSelected && <Check className="w-3.5 h-3.5 text-zinc-950 stroke-[3]" />}
+                            </span>
+                            <div className="flex flex-col min-w-0 w-full">
+                              <span className="text-xs font-semibold truncate text-zinc-200">
+                                {pal.label.split(' ')[0]}
+                              </span>
+                              <span className="text-[10px] font-mono text-zinc-500 truncate">
+                                {pal.swatch}
+                              </span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Custom Color Picker & Live Hex Input */}
+                  <div className="flex flex-col gap-2.5 pt-2 border-t border-white/5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-medium text-zinc-300">
+                        {t('customColorPicker')}
+                      </span>
+                      {settings.accentColor !== 'amber' && (
+                        <button
+                          onClick={() => {
+                            setLocalCustomHex('#f59e0b');
+                            updateSettings({
+                              accentColor: 'amber',
+                              customAccentHex: '#f59e0b'
+                            });
+                          }}
+                          className="text-[11px] text-zinc-400 hover:text-amber-300 underline transition shrink-0 ml-2"
+                        >
+                          {t('resetToAmber')}
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-3 p-3 rounded-xl bg-zinc-900/60 border border-white/[0.06]">
+                      {/* Color swatch input */}
+                      <label
+                        className="relative flex items-center justify-center w-10 h-10 rounded-xl cursor-pointer border-2 border-white/20 hover:border-white/50 transition overflow-hidden shadow-inner shrink-0 group"
+                        title={t('customColorPicker')}
+                      >
+                        <input
+                          type="color"
+                          value={localCustomHex || '#f59e0b'}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setLocalCustomHex(val);
+                            updateSettings({
+                              accentColor: 'custom',
+                              customAccentHex: val
+                            });
+                          }}
+                          className="opacity-0 absolute inset-0 w-full h-full cursor-pointer"
+                        />
+                        <div
+                          className="w-full h-full rounded-xl transition group-hover:scale-110"
+                          style={{ backgroundColor: localCustomHex || '#f59e0b' }}
+                        />
+                      </label>
+
+                      {/* Hex input & apply */}
+                      <div className="flex-1 min-w-[170px] flex items-center gap-2">
+                        <div className="relative flex-1">
+                          <input
+                            type="text"
+                            maxLength={7}
+                            value={localCustomHex}
+                            onChange={(e) => {
+                              let val = e.target.value;
+                              if (!val.startsWith('#') && val.length > 0) val = '#' + val;
+                              setLocalCustomHex(val);
+                              if (/^#[0-9A-Fa-f]{6}$/.test(val)) {
+                                updateSettings({
+                                  accentColor: 'custom',
+                                  customAccentHex: val
+                                });
+                              }
+                            }}
+                            className="w-full px-3 py-1.5 rounded-xl bg-zinc-950/80 border border-white/10 text-xs font-mono text-zinc-100 uppercase tracking-wider focus:outline-none focus:border-amber-400/60 transition"
+                            placeholder="#f59e0b"
+                          />
+                        </div>
+                        <button
+                          onClick={() => {
+                            let val = localCustomHex.trim();
+                            if (!val.startsWith('#') && val.length > 0) val = '#' + val;
+                            if (/^#[0-9A-Fa-f]{6}$/.test(val)) {
+                              updateSettings({
+                                accentColor: 'custom',
+                                customAccentHex: val
+                              });
+                              showToast(t('savedSettings'), 'success');
+                            } else {
+                              showToast('Hex invalid (e.g. #3B82F6)', 'error');
+                            }
+                          }}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition ${
+                            settings.accentColor === 'custom'
+                              ? 'bg-amber-500 hover:bg-amber-400 text-zinc-950 shadow-md shadow-amber-500/20'
+                              : 'bg-white/10 hover:bg-white/15 text-zinc-200'
+                          }`}
+                        >
+                          {t('apply')}
+                        </button>
+                      </div>
+
+                      {/* Quick Inspiration Swatches */}
+                      <div className="flex items-center gap-1.5">
+                        {[
+                          ['#ec4899', 'Neon Pink'],
+                          ['#f97316', 'Orange'],
+                          ['#eab308', 'Gold'],
+                          ['#84cc16', 'Lime'],
+                          ['#14b8a6', 'Teal'],
+                          ['#6366f1', 'Indigo'],
+                          ['#d946ef', 'Fuchsia']
+                        ].map(([hex, name]) => (
+                          <button
+                            key={hex}
+                            onClick={() => {
+                              setLocalCustomHex(hex);
+                              updateSettings({
+                                accentColor: 'custom',
+                                customAccentHex: hex
+                              });
+                            }}
+                            className="w-5 h-5 rounded-lg transition-transform hover:scale-125 border border-white/20 hover:border-white shadow-sm"
+                            style={{ backgroundColor: hex }}
+                            title={`Pick ${name} (${hex})`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="p-4 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2.5">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{t('libraryAndAutomation')}</h3>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 py-1">
+                    <span className="text-xs text-zinc-300">{t('musicFolder')}</span>
                     <div className="flex items-center gap-1.5">
                       <button
-                        onClick={() => handleSelectOrRestoreFolder(null)}
+                        onClick={handleSelectOrRestoreFolder}
+                        className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-300 text-xs flex items-center gap-1"
+                        title={t('rescanFolder')}
+                      >
+                        <RefreshCw className="w-3 h-3 text-amber-400" />
+                        <span>{t('rescan')}</span>
+                      </button>
+                      <button
+                        onClick={handleSelectOrRestoreFolder}
                         className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-xs"
                       >
-                        {rememberedFolder.name ? 'Change' : 'Select'}
+                        {rememberedFolder.name ? t('change') : t('select')}
                       </button>
                       {rememberedFolder.name && (
                         <button
                           onClick={handleForgetRememberedFolder}
                           className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-300 text-xs"
                         >
-                          Forget
+                          {t('forget')}
                         </button>
                       )}
                     </div>
                   </div>
 
+                  <div className="flex items-center justify-between py-1">
+                    <div className="flex flex-col">
+                      <span className="text-xs text-zinc-300">{t('removeDuplicates')}</span>
+                      <span className="text-[11px] text-zinc-500">Tự động phát hiện và dọn bản sao trùng lặp</span>
+                    </div>
+                    <button
+                      onClick={handleFindAndRemoveDuplicates}
+                      className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-medium flex items-center gap-1.5 transition"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                      <span>{t('cleanDuplicates')}</span>
+                    </button>
+                  </div>
+
                   {[
-                    ['gapless', 'Gapless playback (preloads the next track)'],
-                    ['rememberMusicFolder', 'Remember music folder'],
-                    ['autoOnlineMetadata', 'Online music metadata enrichment (MusicBrainz)'],
-                    ['autoOnlineArtwork', 'Online album artwork lookup'],
-                    ['autoOnlineLyrics', 'Synchronized online lyrics (LRCLIB)'],
-                    ['persistBlobsInIdb', 'Cache imported audio in IndexedDB'],
-                    ['ambientGlow', 'Ambient stage lighting'],
-                    ['keyboardShortcuts', 'Keyboard shortcuts']
+                    ['gapless', t('gaplessPlayback')],
+                    ['rememberMusicFolder', t('rememberMusicFolder')],
+                    ['autoOnlineMetadata', t('autoOnlineMetadata')],
+                    ['autoOnlineArtwork', t('autoOnlineArtwork')],
+                    ['autoOnlineLyrics', t('autoOnlineLyrics')],
+                    ['persistBlobsInIdb', t('persistBlobsInIdb')],
+                    ['ambientGlow', t('ambientGlow')],
+                    ['keyboardShortcuts', t('keyboardShortcuts')]
                   ].map(([key, label]) => (
                     <label key={key} className="flex items-center justify-between text-xs text-zinc-300 cursor-pointer py-1">
                       <span>{label}</span>
@@ -5842,12 +6428,12 @@ export default function App() {
                   ))}
 
                   <div className="pt-2 border-t border-white/5 flex items-center justify-between">
-                    <span className="text-xs text-zinc-400">Local Database</span>
+                    <span className="text-xs text-zinc-400">{t('localDatabase')}</span>
                     <button
                       onClick={() =>
                         setConfirmModal({
-                          title: 'Purge Local Database?',
-                          message: 'Remove all imported tracks, cached artwork/lyrics/metadata, playlists, and saved folders.',
+                          title: t('purgeModalTitle'),
+                          message: t('purgeModalDesc'),
                           onConfirm: async () => {
                             await dbClearAll();
                             shouldPlayRef.current = false;
@@ -5873,20 +6459,20 @@ export default function App() {
                               trackCount: 0,
                               lastScannedAt: null
                             });
-                            showToast('Database cleared.', 'info');
+                            showToast(t('databaseCleared'), 'info');
                           }
                         })
                       }
                       className="px-2.5 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 text-xs font-medium"
                     >
-                      Purge
+                      {t('purge')}
                     </button>
                   </div>
                 </div>
 
                 <div className="flex flex-col gap-3">
                   <div className="p-4 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2">
-                    <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Shortcuts</h3>
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{t('shortcuts')}</h3>
                     <div className="grid grid-cols-2 gap-1.5 text-xs">
                       {[
                         ['Space', 'Play / Pause'],
@@ -5906,12 +6492,12 @@ export default function App() {
 
                   <div className="p-4 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Environment & Codecs</span>
+                      <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{t('environmentCodecs')}</span>
                       <button
                         onClick={runSelfDiagnosticsSuite}
                         className="px-2.5 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-[11px] font-medium"
                       >
-                        Self-Test
+                        {t('selfTest')}
                       </button>
                     </div>
                     <div className="flex flex-wrap gap-1.5 pt-1">
@@ -5919,8 +6505,8 @@ export default function App() {
                         <span
                           key={c.ext}
                           className={`text-[10px] font-mono px-2 py-0.5 rounded ${c.support.includes('Unsupported')
-                              ? 'bg-rose-500/15 text-rose-300'
-                              : 'bg-white/5 text-zinc-300'
+                            ? 'bg-rose-500/15 text-rose-300'
+                            : 'bg-white/5 text-zinc-300'
                             }`}
                         >
                           {c.ext}
@@ -6121,7 +6707,7 @@ export default function App() {
             />
 
             <div className="flex items-center gap-3">
-              <span className="text-xs font-mono text-amber-300 w-10 text-right">{formatTime(currentTime)}</span>
+              <span className="text-xs font-mono w-10 text-right" style={{ color: activePalette?.hex300 || '#fcd34d' }}>{formatTime(currentTime)}</span>
               <input
                 type="range"
                 min={0}
@@ -6129,7 +6715,8 @@ export default function App() {
                 step={0.05}
                 value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
                 onChange={(e) => handleSeek(parseFloat(e.target.value))}
-                className="flex-1 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
+                className="flex-1 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer"
               />
               <span className="text-xs font-mono text-zinc-400 w-10">
                 {formatTime(duration || currentTrack?.duration || 0)}
@@ -6254,10 +6841,10 @@ export default function App() {
                   <div
                     key={line.id}
                     className={`text-center max-w-5xl w-full px-2 whitespace-normal break-words [overflow-wrap:anywhere] [text-wrap:balance] leading-relaxed transition-[opacity,color,transform] duration-500 ease-out drop-shadow-[0_4px_16px_rgba(0,0,0,0.9)] ${isActive
-                        ? 'text-2xl sm:text-3xl md:text-4xl lg:text-[42px] font-semibold text-amber-300 opacity-100'
-                        : isPast
-                          ? 'text-base sm:text-lg md:text-xl text-zinc-400 opacity-40'
-                          : 'text-lg sm:text-xl md:text-2xl text-zinc-200 opacity-70'
+                      ? 'text-2xl sm:text-3xl md:text-4xl lg:text-[42px] font-semibold text-amber-300 opacity-100'
+                      : isPast
+                        ? 'text-base sm:text-lg md:text-xl text-zinc-400 opacity-40'
+                        : 'text-lg sm:text-xl md:text-2xl text-zinc-200 opacity-70'
                       }`}
                   >
                     {line.text}

@@ -1,14 +1,12 @@
 [package]
-name = "app"
-version = "0.1.0"
-description = "A Tauri App"
+name = "aurelia-audio"
+version = "0.2.0"
+description = "Aurelia Audio — Audiophile Desktop Music Player"
 authors = ["you"]
 license = ""
 repository = ""
 edition = "2024"
 rust-version = "1.90"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "app_lib"
@@ -21,5 +19,7 @@ tauri-build = { version = "2.7.3", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.12.4", features = [] }
+rfd = "0.15"
+tauri = { version = "2.12.4", features = ["protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-log = "2"
+tauri-plugin-global-shortcut = "2"
