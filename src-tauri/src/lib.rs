@@ -1,3 +1,10 @@
+#[tauri::command]
+fn pick_music_folder() -> Option<String> {
+  rfd::FileDialog::new()
+    .pick_folder()
+    .map(|p| p.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -11,6 +18,8 @@ pub fn run() {
       }
       Ok(())
     })
+    .invoke_handler(tauri::generate_handler![pick_music_folder])
     .run(tauri::generate_context!())
     .expect("error while building tauri application");
 }
+

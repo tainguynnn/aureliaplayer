@@ -88,6 +88,23 @@ export const TRANSLATIONS = {
     deleteTrack: 'Delete Track',
     deleteTrackConfirm: 'Delete "{title}" from library?',
 
+    // Desktop Companion & Smart Metadata Audit
+    desktopCompanion: 'Desktop Companion',
+    miniPlayer: 'Mini Player',
+    alwaysOnTop: 'Always on Top',
+    smartScan: 'Smart Scan',
+    auditMetadata: 'Audit Inconsistent Metadata',
+    smartAuditTitle: 'Smart Metadata Audit & Harmonization',
+    libraryHealthScore: 'Library Consistency Score',
+    autoHarmonize: 'Auto-Harmonize All',
+    harmonizeSuccess: 'Harmonized metadata for {count} track(s).',
+    noIssuesFound: 'All metadata, artwork, and album tags are completely consistent!',
+    albumArtistMismatch: 'Album Artist Inconsistencies',
+    yearMismatch: 'Conflicting Release Years',
+    artworkInconsistency: 'Missing Artwork in Album',
+    trackNumberIssues: 'Track Number Inconsistencies',
+    genreInconsistency: 'Inconsistent Album Genres',
+
     // Toast
     savedSettings: 'Settings saved.',
     databaseCleared: 'Database cleared.'
@@ -141,7 +158,7 @@ export const TRANSLATIONS = {
     favorites: 'Yêu thích',
     queue: 'Hàng đợi',
     lyrics: 'Lời bài hát',
-    equalizer: 'Bộ chỉnh âm PEQ',
+    equalizer: 'Bộ chỉnh âm 10-Band',
     noTracksLoaded: 'Chưa có bài hát nào trong thư viện',
     dropFilesOrSelect: 'Kéo thả tệp âm thanh hoặc chọn thư mục nhạc để bắt đầu nghe nhạc.',
 
@@ -180,6 +197,23 @@ export const TRANSLATIONS = {
     deleteAlbumConfirmDesc: 'Hành động này sẽ xóa album và toàn bộ {count} bài hát bên trong khỏi thư viện.',
     deleteTrack: 'Xóa bài hát',
     deleteTrackConfirm: 'Xóa "{title}" khỏi thư viện?',
+
+    // Desktop Companion & Smart Metadata Audit
+    desktopCompanion: 'Trình phát thu nhỏ (Companion)',
+    miniPlayer: 'Trình phát Mini',
+    alwaysOnTop: 'Luôn ghim trên cùng',
+    smartScan: 'Quét thông minh',
+    auditMetadata: 'Phát hiện metadata không thống nhất',
+    smartAuditTitle: 'Phân tích & Chuẩn hóa Metadata Thư viện',
+    libraryHealthScore: 'Độ đồng nhất Metadata',
+    autoHarmonize: 'Tự động chuẩn hóa tất cả',
+    harmonizeSuccess: 'Đã chuẩn hóa metadata cho {count} bài hát!',
+    noIssuesFound: 'Thư viện hoàn hảo! Toàn bộ metadata, ảnh bìa và thông tin album đều đồng nhất.',
+    albumArtistMismatch: 'Nghệ sĩ Album không khớp',
+    yearMismatch: 'Năm phát hành xung đột',
+    artworkInconsistency: 'Thiếu ảnh bìa trong cùng album',
+    trackNumberIssues: 'Số thứ tự bài thiếu hoặc trùng',
+    genreInconsistency: 'Thể loại không đồng nhất',
 
     // Toast
     savedSettings: 'Đã lưu cài đặt.',

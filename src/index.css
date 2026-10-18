@@ -167,11 +167,16 @@ html[data-theme="light"] .text-zinc-100 {
 
 html[data-theme="light"] .text-zinc-200,
 html[data-theme="light"] .text-zinc-300,
+html[data-theme="light"] .text-zinc-300\/75,
+html[data-theme="light"] .text-zinc-300\/80,
 html[data-theme="light"] .text-zinc-300\/90 {
   color: #1e293b !important;
+  font-weight: 500;
 }
 
-html[data-theme="light"] .text-zinc-400 {
+html[data-theme="light"] .text-zinc-400,
+html[data-theme="light"] .text-zinc-400\/60,
+html[data-theme="light"] .text-zinc-400\/80 {
   color: #334155 !important;
   font-weight: 500;
 }
@@ -182,8 +187,27 @@ html[data-theme="light"] .text-zinc-500 {
 }
 
 html[data-theme="light"] .text-zinc-600 {
-  color: #64748b !important;
+  color: #475569 !important;
+  font-weight: 500;
 }
+
+/* Album Titles & Subtitles in Light Mode */
+html[data-theme="light"] .album-title-text {
+  color: #090d16 !important;
+  font-weight: 600 !important;
+}
+
+html[data-theme="light"] .album-subtitle-text {
+  color: #334155 !important;
+  font-weight: 500 !important;
+}
+
+/* Remove dark muddy drop shadows in Light Mode */
+html[data-theme="light"] .drop-shadow,
+html[data-theme="light"] [class*="drop-shadow"] {
+  filter: none !important;
+}
+
 
 /* Dynamic Accent & Amber Readability Enhancement in Light Mode */
 html[data-theme="light"] .text-amber-300,
@@ -326,4 +350,68 @@ html[data-theme="light"] .aurelia-scrollbar::-webkit-scrollbar-thumb {
 
 html[data-theme="light"] .aurelia-scrollbar::-webkit-scrollbar-thumb:hover {
   background: rgba(15, 23, 42, 0.4) !important;
+}
+
+/* ==========================================================================
+   Fullscreen Player & Lyrics Immersion in Light Mode
+   ========================================================================== */
+html[data-theme="light"] .aurelia-fullscreen-player,
+html[data-theme="light"] .aurelia-fullscreen-lyrics {
+  background-color: #f1f5f9 !important;
+  color: #090d16 !important;
+}
+
+html[data-theme="light"] .aurelia-fullscreen-player .aurelia-fs-backdrop-gradient,
+html[data-theme="light"] .aurelia-fullscreen-lyrics .aurelia-fs-backdrop-gradient {
+  background: linear-gradient(to bottom, rgba(248, 250, 252, 0.72), rgba(241, 245, 249, 0.88), #e2e8f0) !important;
+}
+
+html[data-theme="light"] .aurelia-fullscreen-player .aurelia-fs-artwork-card {
+  box-shadow: 0 25px 60px -12px rgba(15, 23, 42, 0.22), 0 0 0 1px rgba(15, 23, 42, 0.1) !important;
+  background-color: #ffffff !important;
+}
+
+html[data-theme="light"] .aurelia-fullscreen-player h2,
+html[data-theme="light"] .aurelia-fullscreen-lyrics h2 {
+  color: #090d16 !important;
+}
+
+html[data-theme="light"] .aurelia-fullscreen-player .aurelia-fs-artist,
+html[data-theme="light"] .aurelia-fullscreen-lyrics .aurelia-fs-artist {
+  color: var(--accent-hex-700, #b45309) !important;
+  font-weight: 600 !important;
+}
+
+html[data-theme="light"] .aurelia-fullscreen-player .aurelia-fs-album,
+html[data-theme="light"] .aurelia-fullscreen-lyrics .aurelia-fs-album {
+  color: #334155 !important;
+  font-weight: 600 !important;
+}
+
+html[data-theme="light"] .aurelia-fs-lyric-active {
+  color: var(--accent-hex-700, #b45309) !important;
+  opacity: 1 !important;
+}
+
+html[data-theme="light"] .aurelia-fs-lyric-past {
+  color: #64748b !important;
+  opacity: 0.65 !important;
+}
+
+html[data-theme="light"] .aurelia-fs-lyric-future {
+  color: #1e293b !important;
+  opacity: 0.85 !important;
+}
+
+html[data-theme="light"] .aurelia-fullscreen-player .aurelia-fs-btn,
+html[data-theme="light"] .aurelia-fullscreen-lyrics .aurelia-fs-btn {
+  background-color: rgba(15, 23, 42, 0.08) !important;
+  color: #090d16 !important;
+  border: 1px solid rgba(15, 23, 42, 0.12) !important;
+}
+
+html[data-theme="light"] .aurelia-fullscreen-player .aurelia-fs-btn:hover,
+html[data-theme="light"] .aurelia-fullscreen-lyrics .aurelia-fs-btn:hover {
+  background-color: rgba(15, 23, 42, 0.14) !important;
+  color: #090d16 !important;
 }

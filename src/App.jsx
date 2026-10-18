@@ -5,6 +5,7 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { ACCENT_PALETTES, applyAppearanceTokens, getPalette, extractDominantColor } from './theme';
 import { getTranslation } from './i18n';
 import {
+  DEFAULT_PEQ_FREQUENCIES,
   BUILTIN_PEQ_PRESETS,
   validateAndNormalizePeqState,
   applyPeqToAudioNodes
@@ -1769,10 +1770,24 @@ function sortTracksForAlbum(trackList) {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('library'); // 'library' | 'insights' | 'settings'
+  const [activeTab, setActiveTab] = useState('library'); // 'library' | 'equalizer' | 'insights' | 'settings'
   const [fullscreenMode, setFullscreenMode] = useState(null); // null | 'player' | 'lyrics'
   const [toast, setToast] = useState(null);
   const [confirmModal, setConfirmModal] = useState(null);
+
+  // Desktop Companion (Mini Player) & Smart Metadata Audit State
+  const [isMiniPlayer, setIsMiniPlayer] = useState(false);
+  const [alwaysOnTop, setAlwaysOnTop] = useState(true);
+  const savedWindowSizeRef = useRef(null);
+  const [smartAuditResult, setSmartAuditResult] = useState(null);
+
+  // 10-Band Parametric Equalizer State
+  const [peqState, setPeqState] = useState(() => validateAndNormalizePeqState(null));
+  const [customPeqPresets, setCustomPeqPresets] = useState([]);
+  const peqStateRef = useRef(peqState);
+  peqStateRef.current = peqState;
+  const filterNodesRef = useRef([]);
+  const preampGainRef = useRef(null);
 
   // Library, Album Grouping & Playlists state
   const [tracks, setTracks] = useState([]);
@@ -2215,6 +2230,16 @@ export default function App() {
         setSettings((prev) => ({ ...prev, ...savedConfig.value }));
       }
 
+      // Restore 10-band PEQ state and custom user presets
+      const savedPeq = storedSettings.find((s) => s.key === 'peqState');
+      if (savedPeq && savedPeq.value) {
+        setPeqState(validateAndNormalizePeqState(savedPeq.value));
+      }
+      const savedCustomPresets = storedSettings.find((s) => s.key === 'customPeqPresets');
+      if (savedCustomPresets && Array.isArray(savedCustomPresets.value)) {
+        setCustomPeqPresets(savedCustomPresets.value);
+      }
+
       // Restore remembered music folder record natively without localhost permission prompts
       if (savedFolderRecord) {
         setRememberedFolder({
@@ -2233,6 +2258,15 @@ export default function App() {
       isMounted = false;
     };
   }, []);
+
+  // Persist PEQ state and custom presets to IndexedDB
+  useEffect(() => {
+    dbPut('settings', { key: 'peqState', value: peqState }).catch(() => {});
+  }, [peqState]);
+
+  useEffect(() => {
+    dbPut('settings', { key: 'customPeqPresets', value: customPeqPresets }).catch(() => {});
+  }, [customPeqPresets]);
 
   useEffect(() => {
     if (!currentTrack?.coverUrl) return;
@@ -2624,42 +2658,41 @@ export default function App() {
       analyser.fftSize = 512;
       analyser.smoothingTimeConstant = settings.visualizerSmoothing;
 
-      // 3-band gentle shelving/peaking filters for audiophile tone shaping
-      const lowFilter = ctx.createBiquadFilter();
-      lowFilter.type = 'lowshelf';
-      lowFilter.frequency.value = 110;
+      // 10-Band Parametric Equalizer chain with Preamp stage
+      const preampGain = ctx.createGain();
+      const filterNodes = DEFAULT_PEQ_FREQUENCIES.map((freq, idx) => {
+        const node = ctx.createBiquadFilter();
+        node.type = idx === 0 ? 'lowshelf' : idx === 9 ? 'highshelf' : 'peaking';
+        node.frequency.value = freq;
+        return node;
+      });
 
-      const midFilter = ctx.createBiquadFilter();
-      midFilter.type = 'peaking';
-      midFilter.frequency.value = 1800;
-      midFilter.Q.value = 0.9;
-
-      const highFilter = ctx.createBiquadFilter();
-      highFilter.type = 'highshelf';
-      highFilter.frequency.value = 8500;
-
-      // Both decks feed the same EQ / analyser chain
+      // Both decks feed the same Preamp -> 10-Band EQ -> Analyser -> Output chain
       const sources = deckElsRef.current.filter(Boolean).map((el) => {
         const src = ctx.createMediaElementSource(el);
-        src.connect(lowFilter);
+        src.connect(preampGain);
         return src;
       });
       const source = sources[0];
-      lowFilter.connect(midFilter);
-      midFilter.connect(highFilter);
-      highFilter.connect(analyser);
+
+      preampGain.connect(filterNodes[0]);
+      for (let i = 0; i < filterNodes.length - 1; i++) {
+        filterNodes[i].connect(filterNodes[i + 1]);
+      }
+      filterNodes[filterNodes.length - 1].connect(analyser);
       analyser.connect(ctx.destination);
 
       audioCtxRef.current = ctx;
       analyserRef.current = analyser;
       sourceNodeRef.current = source;
-      eqLowRef.current = lowFilter;
-      eqMidRef.current = midFilter;
-      eqHighRef.current = highFilter;
+      preampGainRef.current = preampGain;
+      filterNodesRef.current = filterNodes;
+
+      applyPeqToAudioNodes(ctx, preampGain, filterNodes, peqStateRef.current || peqState);
     } catch (err) {
       console.warn('Web Audio graph setup notice:', err);
     }
-  }, [settings.visualizerSmoothing]);
+  }, [settings.visualizerSmoothing, peqState]);
 
   // Unloads a deck that is no longer the active one
   const finalizeDeck = useCallback((idx) => {
@@ -2706,27 +2739,20 @@ export default function App() {
     if (analyserRef.current) {
       analyserRef.current.smoothingTimeConstant = settings.visualizerSmoothing;
     }
-    if (eqLowRef.current && eqMidRef.current && eqHighRef.current) {
-      const preset = settings.eqPreset;
-      if (preset === 'flat') {
-        eqLowRef.current.gain.value = 0;
-        eqMidRef.current.gain.value = 0;
-        eqHighRef.current.gain.value = 0;
-      } else if (preset === 'warmth') {
-        eqLowRef.current.gain.value = 2.8;
-        eqMidRef.current.gain.value = 0.6;
-        eqHighRef.current.gain.value = -1.5;
-      } else if (preset === 'air') {
-        eqLowRef.current.gain.value = 1.0;
-        eqMidRef.current.gain.value = -0.5;
-        eqHighRef.current.gain.value = 3.2;
-      } else if (preset === 'vocal') {
-        eqLowRef.current.gain.value = -1.0;
-        eqMidRef.current.gain.value = 2.8;
-        eqHighRef.current.gain.value = 1.0;
-      }
+    if (
+      audioCtxRef.current &&
+      preampGainRef.current &&
+      Array.isArray(filterNodesRef.current) &&
+      filterNodesRef.current.length === 10
+    ) {
+      applyPeqToAudioNodes(
+        audioCtxRef.current,
+        preampGainRef.current,
+        filterNodesRef.current,
+        peqState
+      );
     }
-  }, [settings.visualizerSmoothing, settings.eqPreset]);
+  }, [settings.visualizerSmoothing, peqState]);
 
   useEffect(() => {
     let animationId;
@@ -3621,10 +3647,32 @@ export default function App() {
     [processNormalizedImportEntries, settings.rememberMusicFolder]
   );
 
-  const handleSelectOrRestoreFolder = useCallback(() => {
-    // Standard native directory picker - zero localhost permission prompts
-    folderInputRef.current?.click();
-  }, []);
+  const handleSelectOrRestoreFolder = useCallback(async () => {
+    // 1. Desktop shell / Tauri: Use native OS dialog via rfd (zero browser upload prompts)
+    if (typeof window !== 'undefined' && (window.__TAURI__ || window.__TAURI_INTERNALS__)) {
+      try {
+        const picked = await invoke('pick_music_folder');
+        if (picked) {
+          const folderName = picked.split(/[/\\]/).filter(Boolean).pop() || picked;
+          setRememberedFolder({
+            handle: null,
+            name: folderName,
+            mode: 'tauri-native',
+            permissionState: 'granted',
+            trackCount: tracks.length,
+            lastScannedAt: new Date().toISOString()
+          });
+          showToast(`Đã chọn thư mục: ${folderName}`, 'info');
+          return;
+        }
+      } catch (err) {
+        console.warn('Native folder picker fallback:', err);
+      }
+    }
+
+    // 2. Browser: open file picker where selecting audio files (Ctrl+A in folder) never triggers "Only do this if you trust the site"
+    fileInputRef.current?.click();
+  }, [tracks.length, showToast]);
 
   const handleForgetRememberedFolder = useCallback(async () => {
     await dbDelete('handles', 'musicFolder');
@@ -3858,6 +3906,369 @@ export default function App() {
     });
   }, [tracks, currentTrackId, showToast, t]);
 
+  // Helper to safely get the current Tauri window if running in desktop shell
+  const getTauriAppWindow = useCallback(() => {
+    try {
+      if (typeof window !== 'undefined' && (window.__TAURI__ || window.__TAURI_INTERNALS__)) {
+        return getCurrentWindow();
+      }
+    } catch (err) {
+      // ignore
+    }
+    return null;
+  }, []);
+
+  const handleEnterMiniPlayer = useCallback(async () => {
+    const win = getTauriAppWindow();
+    if (win) {
+      try {
+        const curSize = await win.innerSize();
+        if (curSize && curSize.width > 420) {
+          savedWindowSizeRef.current = curSize;
+        }
+        await win.setAlwaysOnTop(alwaysOnTop);
+        await win.setSize(new LogicalSize(380, 160));
+      } catch (e) {
+        console.warn('Could not resize window for mini player:', e);
+      }
+    }
+    setIsMiniPlayer(true);
+  }, [alwaysOnTop, getTauriAppWindow]);
+
+  const handleExitMiniPlayer = useCallback(async () => {
+    const win = getTauriAppWindow();
+    if (win) {
+      try {
+        await win.setAlwaysOnTop(false);
+        if (savedWindowSizeRef.current) {
+          await win.setSize(savedWindowSizeRef.current);
+        } else {
+          await win.setSize(new LogicalSize(1120, 760));
+        }
+      } catch (e) {
+        console.warn('Could not restore window size:', e);
+      }
+    }
+    setIsMiniPlayer(false);
+  }, [getTauriAppWindow]);
+
+  const handleToggleAlwaysOnTop = useCallback(async () => {
+    const next = !alwaysOnTop;
+    setAlwaysOnTop(next);
+    const win = getTauriAppWindow();
+    if (win) {
+      try {
+        await win.setAlwaysOnTop(next);
+      } catch (e) {
+        console.warn('Could not toggle always on top:', e);
+      }
+    }
+  }, [alwaysOnTop, getTauriAppWindow]);
+
+  const handleHideToTray = useCallback(async () => {
+    const win = getTauriAppWindow();
+    if (win) {
+      try {
+        await win.hide();
+      } catch (e) {
+        console.warn('Could not hide window:', e);
+      }
+    }
+  }, [getTauriAppWindow]);
+
+  // Smart Metadata Inconsistency Scan
+  const handleRunSmartMetadataAudit = useCallback(() => {
+    if (!tracks || tracks.length === 0) {
+      showToast(t('noIssuesFound'), 'info');
+      return;
+    }
+
+    const albumGroups = new Map();
+    for (const track of tracks) {
+      const albumKey = (track.album || '').trim().toLowerCase() || '__no_album__';
+      if (!albumGroups.has(albumKey)) {
+        albumGroups.set(albumKey, {
+          albumTitle: track.album || 'Unknown Album',
+          albumId: track.albumId,
+          tracks: []
+        });
+      }
+      albumGroups.get(albumKey).tracks.push(track);
+    }
+
+    const albumIssues = [];
+    let totalDiscrepancies = 0;
+
+    for (const [, group] of albumGroups) {
+      const list = group.tracks;
+      const issuesForAlbum = [];
+
+      // 1. Artwork Inconsistency (sister tracks where some have cover and others don't)
+      const tracksWithCover = list.filter((t) => t.coverUrl && !t.coverUrl.includes('placeholder'));
+      const tracksWithoutCover = list.filter((t) => !t.coverUrl || t.coverUrl.includes('placeholder'));
+      if (tracksWithCover.length > 0 && tracksWithoutCover.length > 0) {
+        issuesForAlbum.push({
+          type: 'artwork',
+          title: t('artworkInconsistency'),
+          detail: `${tracksWithoutCover.length} bài thiếu ảnh bìa trong khi ${tracksWithCover.length} bài khác trong album đã có.`,
+          tracksAffected: tracksWithoutCover.map((t) => t.id)
+        });
+        totalDiscrepancies += tracksWithoutCover.length;
+      }
+
+      // 2. Conflicting Album Artist
+      const albumArtistCounts = new Map();
+      for (const t of list) {
+        const art = (t.albumArtist || t.artist || '').trim();
+        if (art) {
+          albumArtistCounts.set(art, (albumArtistCounts.get(art) || 0) + 1);
+        }
+      }
+      if (albumArtistCounts.size > 1 && list.length > 1) {
+        const dominantArtist = [...albumArtistCounts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+        const outlierTracks = list.filter((t) => {
+          const art = (t.albumArtist || t.artist || '').trim();
+          return art && art !== dominantArtist;
+        });
+        if (outlierTracks.length > 0) {
+          issuesForAlbum.push({
+            type: 'albumArtist',
+            title: t('albumArtistMismatch'),
+            detail: `Nghệ sĩ album chủ đạo là "${dominantArtist}", nhưng có ${outlierTracks.length} bài ghi khác.`,
+            dominantValue: dominantArtist,
+            tracksAffected: outlierTracks.map((t) => t.id)
+          });
+          totalDiscrepancies += outlierTracks.length;
+        }
+      }
+
+      // 3. Conflicting Year
+      const yearCounts = new Map();
+      for (const t of list) {
+        const yr = t.year ? String(t.year).trim() : null;
+        if (yr && yr !== '0' && yr !== 'null') {
+          yearCounts.set(yr, (yearCounts.get(yr) || 0) + 1);
+        }
+      }
+      if (yearCounts.size > 1 || (yearCounts.size === 1 && list.some((t) => !t.year))) {
+        const dominantYear = yearCounts.size > 0 ? [...yearCounts.entries()].sort((a, b) => b[1] - a[1])[0][0] : null;
+        const outlierTracks = list.filter((t) => String(t.year || '').trim() !== dominantYear);
+        if (dominantYear && outlierTracks.length > 0) {
+          issuesForAlbum.push({
+            type: 'year',
+            title: t('yearMismatch'),
+            detail: `Năm phát hành chủ đạo là ${dominantYear}, nhưng có ${outlierTracks.length} bài bị lệch năm hoặc thiếu năm.`,
+            dominantValue: dominantYear,
+            tracksAffected: outlierTracks.map((t) => t.id)
+          });
+          totalDiscrepancies += outlierTracks.length;
+        }
+      }
+
+      // 4. Conflicting Genre
+      const genreCounts = new Map();
+      for (const t of list) {
+        const g = (t.genre || '').trim();
+        if (g) {
+          genreCounts.set(g, (genreCounts.get(g) || 0) + 1);
+        }
+      }
+      if (genreCounts.size > 1 || (genreCounts.size === 1 && list.some((t) => !t.genre))) {
+        const dominantGenre = genreCounts.size > 0 ? [...genreCounts.entries()].sort((a, b) => b[1] - a[1])[0][0] : null;
+        const outlierTracks = list.filter((t) => (t.genre || '').trim() !== dominantGenre);
+        if (dominantGenre && outlierTracks.length > 0) {
+          issuesForAlbum.push({
+            type: 'genre',
+            title: t('genreInconsistency'),
+            detail: `Thể loại chính là "${dominantGenre}", nhưng có ${outlierTracks.length} bài thiếu hoặc khác thể loại.`,
+            dominantValue: dominantGenre,
+            tracksAffected: outlierTracks.map((t) => t.id)
+          });
+          totalDiscrepancies += outlierTracks.length;
+        }
+      }
+
+      // 5. Track Number Inconsistencies (missing track number or duplicates within album)
+      if (list.length > 1) {
+        const seenTrackNums = new Set();
+        const duplicateOrMissingTracks = [];
+        for (const t of list) {
+          const num = t.trackNumber;
+          const disc = t.discNumber || 1;
+          const key = `${disc}#${num}`;
+          if (!num || num <= 0 || seenTrackNums.has(key)) {
+            duplicateOrMissingTracks.push(t);
+          } else {
+            seenTrackNums.add(key);
+          }
+        }
+        if (duplicateOrMissingTracks.length > 0) {
+          issuesForAlbum.push({
+            type: 'trackNumber',
+            title: t('trackNumberIssues'),
+            detail: `Có ${duplicateOrMissingTracks.length} bài thiếu số thứ tự hoặc trùng số bài hát trong album.`,
+            tracksAffected: duplicateOrMissingTracks.map((t) => t.id)
+          });
+          totalDiscrepancies += duplicateOrMissingTracks.length;
+        }
+      }
+
+      if (issuesForAlbum.length > 0) {
+        albumIssues.push({
+          albumTitle: group.albumTitle,
+          albumId: group.albumId,
+          tracksCount: list.length,
+          tracks: list,
+          issues: issuesForAlbum
+        });
+      }
+    }
+
+    const totalChecked = Math.max(1, tracks.length * 2);
+    const healthScore = Math.max(0, Math.min(100, Math.round(100 - (totalDiscrepancies / totalChecked) * 100)));
+
+    setSmartAuditResult({
+      healthScore,
+      totalDiscrepancies,
+      albumIssues,
+      scannedAt: new Date().toLocaleTimeString(),
+      totalTracks: tracks.length,
+      totalAlbums: albumGroups.size
+    });
+  }, [tracks, showToast, t]);
+
+  // Auto-Harmonize
+  const handleAutoHarmonizeMetadata = useCallback(async () => {
+    if (!smartAuditResult || !smartAuditResult.albumIssues || smartAuditResult.albumIssues.length === 0) {
+      return;
+    }
+
+    const trackUpdates = new Map();
+
+    for (const albumReport of smartAuditResult.albumIssues) {
+      const list = albumReport.tracks;
+      if (!list || list.length === 0) continue;
+
+      const masterWithCover =
+        list.find((t) => t.coverUrl && !t.coverUrl.includes('placeholder') && t.isArtworkVerified) ||
+        list.find((t) => t.coverUrl && !t.coverUrl.includes('placeholder'));
+
+      const artistCounts = new Map();
+      for (const t of list) {
+        const art = (t.albumArtist || t.artist || '').trim();
+        if (art) artistCounts.set(art, (artistCounts.get(art) || 0) + 1);
+      }
+      const dominantArtist =
+        artistCounts.size > 0 ? [...artistCounts.entries()].sort((a, b) => b[1] - a[1])[0][0] : null;
+
+      const yearCounts = new Map();
+      for (const t of list) {
+        const yr = t.year ? String(t.year).trim() : null;
+        if (yr && yr !== '0' && yr !== 'null') yearCounts.set(yr, (yearCounts.get(yr) || 0) + 1);
+      }
+      const dominantYear =
+        yearCounts.size > 0 ? [...yearCounts.entries()].sort((a, b) => b[1] - a[1])[0][0] : null;
+
+      const genreCounts = new Map();
+      for (const t of list) {
+        const g = (t.genre || '').trim();
+        if (g) genreCounts.set(g, (genreCounts.get(g) || 0) + 1);
+      }
+      const dominantGenre =
+        genreCounts.size > 0 ? [...genreCounts.entries()].sort((a, b) => b[1] - a[1])[0][0] : null;
+
+      const sorted = sortTracksForAlbum(list);
+      const needNumberFix = albumReport.issues.some((iss) => iss.type === 'trackNumber');
+
+      for (let i = 0; i < sorted.length; i++) {
+        const trk = sorted[i];
+        let changed = false;
+        let updated = { ...trk };
+
+        if (masterWithCover && (!updated.coverUrl || updated.coverUrl.includes('placeholder'))) {
+          updated.coverUrl = masterWithCover.coverUrl;
+          updated.picture = masterWithCover.picture;
+          updated.isArtworkVerified = true;
+          if (masterWithCover.dominantColor) {
+            updated.dominantColor = masterWithCover.dominantColor;
+          }
+          changed = true;
+        }
+
+        if (dominantArtist && (!updated.albumArtist || updated.albumArtist !== dominantArtist)) {
+          updated.albumArtist = dominantArtist;
+          changed = true;
+        }
+
+        if (dominantYear && String(updated.year || '').trim() !== dominantYear) {
+          updated.year = dominantYear;
+          changed = true;
+        }
+
+        if (dominantGenre && (updated.genre || '').trim() !== dominantGenre) {
+          updated.genre = dominantGenre;
+          changed = true;
+        }
+
+        if (needNumberFix) {
+          const expectedNum = i + 1;
+          if (updated.trackNumber !== expectedNum) {
+            updated.trackNumber = expectedNum;
+            if (!updated.trackTotal || updated.trackTotal < sorted.length) {
+              updated.trackTotal = sorted.length;
+            }
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          trackUpdates.set(updated.id, updated);
+        }
+      }
+    }
+
+    if (trackUpdates.size === 0) {
+      showToast('Tất cả metadata đã đồng nhất.', 'info');
+      return;
+    }
+
+    for (const [, updatedTrk] of trackUpdates) {
+      try {
+        await dbPut('tracks', {
+          ...updatedTrk,
+          objectUrl: null,
+          audioBlob: settings.persistBlobsInIdb ? updatedTrk.audioBlob : null
+        });
+      } catch (err) {
+        console.warn('Failed to persist harmonized track to IndexedDB:', err);
+      }
+    }
+
+    setTracks((prevTracks) => {
+      return prevTracks.map((t) => (trackUpdates.has(t.id) ? trackUpdates.get(t.id) : t));
+    });
+
+    const harmonizedCount = trackUpdates.size;
+    showToast(
+      (t('harmonizeSuccess') || 'Đã chuẩn hóa metadata cho {count} bài hát!').replace(
+        '{count}',
+        harmonizedCount
+      ),
+      'success'
+    );
+
+    setSmartAuditResult((prev) =>
+      prev
+        ? {
+            ...prev,
+            healthScore: 100,
+            totalDiscrepancies: 0,
+            albumIssues: []
+          }
+        : null
+    );
+  }, [smartAuditResult, settings.persistBlobsInIdb, showToast, t]);
+
   const runSelfDiagnosticsSuite = useCallback(async () => {
     // Build a virtual nested directory fixture with multiple albums, discs, and .m3u/.m3u8/.cue/.jpg non-audio files:
     // Music/Radiohead/Kid A/Disc 1/01... + 02... + 00 - Kid A.m3u AND Music/Daft Punk/Discovery/01... + playlist.m3u8
@@ -3981,6 +4392,11 @@ export default function App() {
 
   useEffect(() => {
     const handleKeyDown = (e) => {
+      if (e.key === 'Escape' && isMiniPlayer) {
+        e.preventDefault();
+        handleExitMiniPlayer();
+        return;
+      }
       if (e.key === 'Escape' && fullscreenMode !== null) {
         e.preventDefault();
         exitFullscreenMode();
@@ -4024,6 +4440,8 @@ export default function App() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
+    isMiniPlayer,
+    handleExitMiniPlayer,
     fullscreenMode,
     exitFullscreenMode,
     settings.keyboardShortcuts,
@@ -4640,7 +5058,18 @@ export default function App() {
           </div>
 
           {/* Quick actions & Window controls */}
-          <div className="pointer-events-none flex items-center justify-end shrink-0 md:shrink self-stretch">
+          <div className="pointer-events-none flex items-center justify-end shrink-0 md:shrink self-stretch gap-1.5">
+            <button
+              style={NO_DRAG_STYLE}
+              onClick={handleEnterMiniPlayer}
+              className="pointer-events-auto h-7 px-2.5 my-auto rounded-lg bg-white/5 hover:bg-amber-500/20 border border-white/10 hover:border-amber-400/40 text-zinc-300 hover:text-amber-300 flex items-center gap-1.5 transition text-xs font-medium"
+              title={t('desktopCompanion')}
+              aria-label={t('desktopCompanion')}
+            >
+              <Pin className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline">{t('miniPlayer')}</span>
+            </button>
+
             {showWindowControls && (
               <div
                 style={NO_DRAG_STYLE}
@@ -4705,6 +5134,7 @@ export default function App() {
           <nav className="flex items-center gap-1 bg-white/[0.03] p-1 rounded-xl border border-white/[0.07] overflow-x-auto max-w-full no-scrollbar">
             {[
               { id: 'library', label: t('library'), icon: Music },
+              { id: 'equalizer', label: t('equalizer') || 'Equalizer', icon: SlidersHorizontal },
               { id: 'insights', label: t('signals'), icon: Activity },
               { id: 'settings', label: t('settings'), icon: Settings }
             ].map((item) => {
@@ -4889,6 +5319,14 @@ export default function App() {
                 >
                   <Maximize2 className="w-3.5 h-3.5" />
                 </button>
+                <button
+                  onClick={handleEnterMiniPlayer}
+                  className="p-2 rounded-xl bg-black/35 hover:bg-black/60 text-zinc-300 hover:text-amber-300 border border-white/10 transition"
+                  title={t('desktopCompanion')}
+                  aria-label={t('desktopCompanion')}
+                >
+                  <Pin className="w-3.5 h-3.5" />
+                </button>
               </div>
             </div>
 
@@ -4909,9 +5347,9 @@ export default function App() {
                 )}
               </div>
 
-              <div className="text-center sm:text-left lg:text-center min-w-0 flex-1 w-full px-1 drop-shadow-[0_2px_10px_rgba(0,0,0,0.85)]">
+              <div className="text-center sm:text-left lg:text-center min-w-0 flex-1 w-full px-1 drop-shadow dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.85)]">
                 <h1
-                  className="text-base sm:text-lg font-semibold text-white tracking-tight truncate"
+                  className="text-base sm:text-lg font-semibold text-zinc-900 dark:text-white tracking-tight truncate"
                   title={currentTrack?.title}
                 >
                   {currentTrack?.title || 'No Track Selected'}
@@ -4924,11 +5362,11 @@ export default function App() {
                       setLibraryViewMode('albums');
                     }
                   }}
-                  className="text-xs sm:text-sm text-amber-300/90 hover:text-amber-200 font-medium truncate mt-0.5 cursor-pointer"
+                  className="text-xs sm:text-sm text-amber-500 dark:text-amber-300/90 hover:text-amber-600 dark:hover:text-amber-200 font-medium truncate mt-0.5 cursor-pointer"
                   title={currentTrack?.album ? `${currentTrack.artist} — ${currentTrack.album}` : currentTrack?.artist}
                 >
                   {currentTrack?.artist || 'Aurelia'}
-                  {currentTrack?.album ? <span className="text-zinc-300/75"> • {currentTrack.album}</span> : null}
+                  {currentTrack?.album ? <span className="text-zinc-700 dark:text-zinc-300 font-medium album-subtitle-text"> • {currentTrack.album}</span> : null}
                 </p>
               </div>
             </div>
@@ -5107,10 +5545,14 @@ export default function App() {
 
               {/* Minimal EQ Strip */}
               <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-white/[0.07]">
-                <span className="text-[10px] text-zinc-400 flex items-center gap-1">
+                <button
+                  onClick={() => setActiveTab('equalizer')}
+                  className="text-[10px] text-zinc-400 hover:text-amber-300 flex items-center gap-1 transition"
+                  title="Open 10-Band Parametric Equalizer"
+                >
                   <SlidersHorizontal className="w-3 h-3 text-amber-400/80" />
-                  <span>Tone</span>
-                </span>
+                  <span>EQ 10-Band</span>
+                </button>
                 <div className="flex items-center gap-1">
                   {[
                     { id: 'flat', label: 'Linear' },
@@ -5120,7 +5562,25 @@ export default function App() {
                   ].map((eq) => (
                     <button
                       key={eq.id}
-                      onClick={() => updateSetting('eqPreset', eq.id)}
+                      onClick={() => {
+                        updateSetting('eqPreset', eq.id);
+                        const presetMap = {
+                          flat: 'builtin-flat',
+                          warmth: 'builtin-warm',
+                          air: 'builtin-bright',
+                          vocal: 'builtin-vocal'
+                        };
+                        const targetId = presetMap[eq.id] || 'builtin-flat';
+                        const found = BUILTIN_PEQ_PRESETS.find((p) => p.id === targetId);
+                        if (found) {
+                          setPeqState((prev) => ({
+                            ...prev,
+                            activePresetId: found.id,
+                            preamp: found.preamp,
+                            bands: found.bands.map((b) => ({ ...b }))
+                          }));
+                        }
+                      }}
                       className={`px-2 py-0.5 rounded-lg text-[10px] font-medium transition ${settings.eqPreset === eq.id
                         ? 'bg-amber-500/25 text-amber-300 border border-amber-400/30'
                         : 'text-zinc-400 hover:text-white hover:bg-white/5'
@@ -5169,6 +5629,14 @@ export default function App() {
                       >
                         <Sparkles className="w-3 h-3 text-amber-400" />
                         <span>{t('cleanDuplicates')}</span>
+                      </button>
+                      <button
+                        onClick={handleRunSmartMetadataAudit}
+                        className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 text-xs flex items-center gap-1.5 transition"
+                        title={t('auditMetadata')}
+                      >
+                        <Shield className="w-3 h-3 text-sky-400" />
+                        <span>{t('smartScan')}</span>
                       </button>
                       <button
                         onClick={handleSelectOrRestoreFolder}
@@ -5433,13 +5901,13 @@ export default function App() {
                                 </div>
 
                                 <h3
-                                  className={`text-xs font-semibold truncate ${isSelected ? 'text-amber-300' : 'text-zinc-100'
+                                  className={`text-xs font-semibold truncate album-title-text ${isSelected ? 'text-amber-500 dark:text-amber-300' : 'text-zinc-900 dark:text-zinc-100'
                                     }`}
                                   title={album.title}
                                 >
                                   {album.title}
                                 </h3>
-                                <p className="text-[11px] text-zinc-400 truncate" title={album.artist}>
+                                <p className="text-[11px] text-zinc-600 dark:text-zinc-400 truncate album-subtitle-text" title={album.artist}>
                                   {album.artist}
                                 </p>
                               </div>
@@ -5461,13 +5929,13 @@ export default function App() {
                           <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-white/[0.07] shrink-0">
                             <div className="min-w-0 flex-1">
                               <h3
-                                className="text-sm font-semibold text-white truncate"
+                                className="text-sm font-semibold text-zinc-900 dark:text-white truncate album-title-text"
                                 title={activeSelectedAlbum.title}
                               >
                                 {activeSelectedAlbum.title}
                               </h3>
                               <p
-                                className="text-xs text-zinc-400 truncate"
+                                className="text-xs text-zinc-600 dark:text-zinc-400 truncate album-subtitle-text"
                                 title={activeSelectedAlbum.folderPath || activeSelectedAlbum.artist}
                               >
                                 {activeSelectedAlbum.artist} • {activeSelectedAlbum.tracks.length} tracks
@@ -5615,7 +6083,7 @@ export default function App() {
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-2">
                                 <span
-                                  className={`text-xs font-medium truncate ${isCurrent ? 'text-amber-300 font-semibold' : 'text-zinc-100'
+                                  className={`text-xs font-medium truncate ${isCurrent ? 'text-amber-500 dark:text-amber-300 font-semibold' : 'text-zinc-900 dark:text-zinc-100'
                                     }`}
                                   title={track.title}
                                 >
@@ -5627,8 +6095,8 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <div className="text-[11px] text-zinc-400 truncate">
-                                {track.artist} • {track.album}
+                              <div className="text-[11px] text-zinc-600 dark:text-zinc-400 truncate">
+                                {track.artist} • <span className="text-zinc-900 dark:text-zinc-300 font-medium album-subtitle-text">{track.album}</span>
                               </div>
                             </div>
                           </div>
@@ -6070,6 +6538,18 @@ export default function App() {
             </div>
           )}
 
+          {/* TAB: 10-BAND PARAMETRIC EQUALIZER */}
+          {activeTab === 'equalizer' && (
+            <PeqPanel
+              peqState={peqState}
+              onChangePeqState={setPeqState}
+              customPresets={customPeqPresets}
+              onChangeCustomPresets={setCustomPeqPresets}
+              filterNodesRef={filterNodesRef}
+              showToast={showToast}
+            />
+          )}
+
           {/* TAB 3: SETTINGS */}
           {activeTab === 'settings' && (
             <div className="aurelia-glass-panel flex-1 min-h-0 overflow-y-auto aurelia-scrollbar rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-5 shadow-2xl flex flex-col gap-4">
@@ -6406,6 +6886,20 @@ export default function App() {
                     </button>
                   </div>
 
+                  <div className="flex items-center justify-between py-1">
+                    <div className="flex flex-col">
+                      <span className="text-xs text-zinc-300">{t('auditMetadata')}</span>
+                      <span className="text-[11px] text-zinc-500">Phát hiện và tự động chuẩn hóa metadata, ảnh bìa, năm phát hành</span>
+                    </div>
+                    <button
+                      onClick={handleRunSmartMetadataAudit}
+                      className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 text-xs font-medium flex items-center gap-1.5 transition"
+                    >
+                      <Shield className="w-3.5 h-3.5 text-sky-400" />
+                      <span>{t('smartScan')}</span>
+                    </button>
+                  </div>
+
                   {[
                     ['gapless', t('gaplessPlayback')],
                     ['rememberMusicFolder', t('rememberMusicFolder')],
@@ -6594,7 +7088,7 @@ export default function App() {
       { }
       {/* FULLSCREEN MODE A: IMMERSIVE FULLSCREEN PLAYER */}
       {fullscreenMode === 'player' && (
-        <div className="fixed inset-0 z-50 bg-[#050609] flex flex-col justify-between p-6 sm:p-10 overflow-hidden no-scrollbar">
+        <div className="aurelia-fullscreen-player fixed inset-0 z-50 bg-[#050609] flex flex-col justify-between p-6 sm:p-10 overflow-hidden no-scrollbar">
           {/* Smooth Crossfade Ambient Artwork Background */}
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
             {backdropState.prevUrl && (
@@ -6612,19 +7106,19 @@ export default function App() {
                 className="absolute inset-0 w-full h-full object-cover scale-110 blur-3xl opacity-50 transition-all duration-700 ease-out"
               />
             )}
-            <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-black/65 to-black/90" />
+            <div className="aurelia-fs-backdrop-gradient absolute inset-0 bg-gradient-to-b from-black/50 via-black/65 to-black/90" />
           </div>
 
           {/* Top Bar */}
           <div className="relative z-10 flex items-center justify-between shrink-0">
-            <div className="flex items-center gap-2 text-xs font-mono text-zinc-300/80">
-              <Disc className={`w-4 h-4 text-amber-400 ${isPlaying ? 'animate-spin' : ''}`} style={{ animationDuration: '6s' }} />
+            <div className="flex items-center gap-2 text-xs font-mono text-zinc-700 dark:text-zinc-300/80">
+              <Disc className={`w-4 h-4 text-amber-500 dark:text-amber-400 ${isPlaying ? 'animate-spin' : ''}`} style={{ animationDuration: '6s' }} />
               <span>{currentTrack?.codec?.split(' ')[0] || 'AURELIA'}</span>
             </div>
             <div className="flex items-center gap-2">
               <button
                 onClick={(e) => toggleFullscreenMode('lyrics', e.currentTarget)}
-                className="p-2.5 rounded-xl bg-white/10 hover:bg-white/15 text-zinc-200 hover:text-amber-300 transition"
+                className="aurelia-fs-btn p-2.5 rounded-xl bg-white/10 hover:bg-white/15 text-zinc-700 dark:text-zinc-200 hover:text-amber-500 dark:hover:text-amber-300 transition"
                 title="Lyrics Fullscreen"
                 aria-label="Lyrics Fullscreen"
               >
@@ -6632,7 +7126,7 @@ export default function App() {
               </button>
               <button
                 onClick={exitFullscreenMode}
-                className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-medium flex items-center gap-2 transition"
+                className="aurelia-fs-btn px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-zinc-900 dark:text-white text-xs font-medium flex items-center gap-2 transition"
                 title="Exit Fullscreen (Esc)"
               >
                 <Minimize2 className="w-4 h-4" />
@@ -6644,7 +7138,7 @@ export default function App() {
           {/* Center Artwork + Integrated Multi-Line Background Lyrics */}
           <div className="relative z-10 flex-1 min-h-0 flex flex-col lg:flex-row items-center justify-center gap-8 lg:gap-14 my-4 overflow-hidden no-scrollbar">
             <div className="flex flex-col items-center text-center shrink-0">
-              <div className="w-44 h-44 sm:w-60 sm:h-60 lg:w-72 lg:h-72 rounded-3xl overflow-hidden shadow-[0_28px_80px_rgba(0,0,0,0.85)] ring-1 ring-white/15 bg-zinc-900">
+              <div className="aurelia-fs-artwork-card w-44 h-44 sm:w-60 sm:h-60 lg:w-72 lg:h-72 rounded-3xl overflow-hidden shadow-[0_28px_80px_rgba(0,0,0,0.85)] ring-1 ring-white/15 bg-zinc-900">
                 {currentTrack?.coverUrl && (
                   <img
                     key={currentTrack.coverUrl}
@@ -6654,18 +7148,18 @@ export default function App() {
                   />
                 )}
               </div>
-              <h2 className="text-xl sm:text-2xl font-bold text-white mt-4 max-w-md truncate drop-shadow">
+              <h2 className="text-xl sm:text-2xl font-bold text-zinc-900 dark:text-white mt-4 max-w-md truncate drop-shadow dark:drop-shadow">
                 {currentTrack?.title}
               </h2>
-              <p className="text-sm text-amber-300/90 mt-1 max-w-md truncate drop-shadow">
+              <p className="aurelia-fs-artist text-sm text-amber-600 dark:text-amber-300/90 mt-1 max-w-md truncate drop-shadow dark:drop-shadow">
                 {currentTrack?.artist}
-                {currentTrack?.album ? <span className="text-zinc-400"> • {currentTrack.album}</span> : null}
+                {currentTrack?.album ? <span className="aurelia-fs-album text-zinc-600 dark:text-zinc-400"> • {currentTrack.album}</span> : null}
               </p>
             </div>
 
             <div className="flex-1 max-w-2xl w-full flex flex-col items-center justify-center gap-5 px-4 overflow-hidden no-scrollbar">
               {visibleLyricsWindow.length === 0 ? (
-                <span className="text-sm text-zinc-400/60 font-medium drop-shadow">
+                <span className="text-sm text-zinc-500 dark:text-zinc-400/60 font-medium drop-shadow dark:drop-shadow">
                   {autoLyricsState.status === 'loading' ? 'Syncing lyrics...' : '♪'}
                 </span>
               ) : (
@@ -6681,12 +7175,12 @@ export default function App() {
                           handleSeek(Math.max(0, line.timeSec + offsetSec));
                         }
                       }}
-                      className={`text-center lg:text-left w-full whitespace-normal break-words [overflow-wrap:anywhere] [text-wrap:balance] leading-snug transition-[opacity,color,transform] duration-300 ease-out drop-shadow-[0_2px_12px_rgba(0,0,0,0.9)] ${line.timeSec !== null ? 'cursor-pointer' : ''
+                      className={`text-center lg:text-left w-full whitespace-normal break-words [overflow-wrap:anywhere] [text-wrap:balance] leading-snug transition-[opacity,color,transform] duration-300 ease-out drop-shadow dark:drop-shadow-[0_2px_12px_rgba(0,0,0,0.9)] ${line.timeSec !== null ? 'cursor-pointer' : ''
                         } ${isActive
-                          ? 'text-xl sm:text-2xl lg:text-3xl font-bold text-amber-300 opacity-100'
+                          ? 'aurelia-fs-lyric-active text-xl sm:text-2xl lg:text-3xl font-bold text-amber-500 dark:text-amber-300 opacity-100'
                           : isPast
-                            ? 'text-sm sm:text-base lg:text-lg text-zinc-400 opacity-40'
-                            : 'text-base sm:text-lg lg:text-xl text-zinc-200 opacity-75 hover:opacity-100'
+                            ? 'aurelia-fs-lyric-past text-sm sm:text-base lg:text-lg text-zinc-500 dark:text-zinc-400 opacity-40'
+                            : 'aurelia-fs-lyric-future text-base sm:text-lg lg:text-xl text-zinc-800 dark:text-zinc-200 opacity-75 hover:opacity-100'
                         }`}
                     >
                       {line.text}
@@ -6782,7 +7276,7 @@ export default function App() {
 
       {/* FULLSCREEN MODE B: DEDICATED LYRICS-ONLY FULLSCREEN (NO TRUNCATION, NATURAL MULTI-LINE WRAPPING) */}
       {fullscreenMode === 'lyrics' && (
-        <div className="fixed inset-0 z-50 bg-[#050609] flex flex-col justify-between p-6 sm:p-12 overflow-hidden no-scrollbar">
+        <div className="aurelia-fullscreen-lyrics fixed inset-0 z-50 bg-[#050609] flex flex-col justify-between p-6 sm:p-12 overflow-hidden no-scrollbar">
           {/* Softly Blurred & Darkened Ambient Artwork Background */}
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
             {backdropState.prevUrl && (
@@ -6800,22 +7294,22 @@ export default function App() {
                 className="absolute inset-0 w-full h-full object-cover scale-125 blur-[90px] opacity-35 transition-all duration-700 ease-out"
               />
             )}
-            <div className="absolute inset-0 bg-gradient-to-b from-black/70 via-black/75 to-black/90" />
+            <div className="aurelia-fs-backdrop-gradient absolute inset-0 bg-gradient-to-b from-black/70 via-black/75 to-black/90" />
           </div>
 
           {/* Minimal Top Bar: Small Unobtrusive Song Title & Artist + Minimal Exit Control */}
           <div className="relative z-10 flex items-center justify-between gap-4 shrink-0">
             <div className="min-w-0">
-              <div className="text-xs font-medium text-zinc-300 truncate">
+              <div className="text-xs font-semibold text-zinc-900 dark:text-zinc-300 truncate">
                 {currentTrack?.title || 'No Track Selected'}
               </div>
-              <div className="text-[11px] text-zinc-500 truncate">
+              <div className="text-[11px] text-zinc-600 dark:text-zinc-500 truncate">
                 {currentTrack?.artist}
               </div>
             </div>
             <button
               onClick={exitFullscreenMode}
-              className="p-2 rounded-xl bg-white/[0.06] hover:bg-white/15 text-zinc-400 hover:text-white transition shrink-0"
+              className="aurelia-fs-btn p-2 rounded-xl bg-white/[0.06] hover:bg-white/15 text-zinc-700 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white transition shrink-0"
               title="Exit Lyrics Fullscreen (Esc)"
               aria-label="Exit Lyrics Fullscreen"
             >
@@ -6826,7 +7320,7 @@ export default function App() {
           {/* Synchronized Multi-Line Wrapping Lyrics as Sole Visual Focus (No Ellipsis, No Scrollbar) */}
           <div className="relative z-10 flex-1 min-h-0 flex flex-col items-center justify-center gap-6 sm:gap-8 px-4 sm:px-12 lg:px-20 py-6 overflow-hidden no-scrollbar">
             {visibleLyricsWindow.length === 0 ? (
-              <div className="text-sm text-zinc-500 font-medium tracking-wide">
+              <div className="text-sm text-zinc-500 dark:text-zinc-400 font-medium tracking-wide">
                 {autoLyricsState.status === 'loading'
                   ? 'Syncing lyrics...'
                   : autoLyricsState.status === 'offline'
@@ -6840,11 +7334,11 @@ export default function App() {
                 return (
                   <div
                     key={line.id}
-                    className={`text-center max-w-5xl w-full px-2 whitespace-normal break-words [overflow-wrap:anywhere] [text-wrap:balance] leading-relaxed transition-[opacity,color,transform] duration-500 ease-out drop-shadow-[0_4px_16px_rgba(0,0,0,0.9)] ${isActive
-                      ? 'text-2xl sm:text-3xl md:text-4xl lg:text-[42px] font-semibold text-amber-300 opacity-100'
+                    className={`text-center max-w-5xl w-full px-2 whitespace-normal break-words [overflow-wrap:anywhere] [text-wrap:balance] leading-relaxed transition-[opacity,color,transform] duration-500 ease-out drop-shadow dark:drop-shadow-[0_4px_16px_rgba(0,0,0,0.9)] ${isActive
+                      ? 'aurelia-fs-lyric-active text-2xl sm:text-3xl md:text-4xl lg:text-[42px] font-semibold text-amber-500 dark:text-amber-300 opacity-100'
                       : isPast
-                        ? 'text-base sm:text-lg md:text-xl text-zinc-400 opacity-40'
-                        : 'text-lg sm:text-xl md:text-2xl text-zinc-200 opacity-70'
+                        ? 'aurelia-fs-lyric-past text-base sm:text-lg md:text-xl text-zinc-500 dark:text-zinc-400 opacity-40'
+                        : 'aurelia-fs-lyric-future text-lg sm:text-xl md:text-2xl text-zinc-800 dark:text-zinc-200 opacity-70'
                       }`}
                   >
                     {line.text}
@@ -6856,6 +7350,171 @@ export default function App() {
 
           <div className="relative z-10 h-4 shrink-0" />
         </div>
+      )}
+
+      {/* Smart Metadata Audit & Harmonization Modal */}
+      {smartAuditResult && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-zinc-900 border border-white/15 rounded-3xl max-w-2xl w-full max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+            {/* Modal Header */}
+            <div className="p-6 pb-4 border-b border-white/10 flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-sky-400 to-sky-600 flex items-center justify-center shadow-lg shadow-sky-500/20 text-zinc-950 shrink-0">
+                  <Shield className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-bold text-white tracking-tight">
+                    {t('smartAuditTitle')}
+                  </h3>
+                  <p className="text-xs text-zinc-400">
+                    {t('libraryHealthScore')}: <span className="font-semibold text-white">{smartAuditResult.healthScore}%</span>
+                    {' • '}
+                    {smartAuditResult.totalTracks} {t('tracksCount')}
+                    {' • '}
+                    {smartAuditResult.totalAlbums} albums
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setSmartAuditResult(null)}
+                className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Health Score Banner */}
+            <div className="px-6 py-3 bg-white/[0.03] border-b border-white/10 flex items-center justify-between gap-4">
+              <div className="flex-1">
+                <div className="flex items-center justify-between text-xs mb-1.5">
+                  <span className="font-medium text-zinc-300">
+                    {smartAuditResult.albumIssues.length === 0
+                      ? t('noIssuesFound')
+                      : `Phát hiện ${smartAuditResult.totalDiscrepancies} điểm bất thường trong ${smartAuditResult.albumIssues.length} album`}
+                  </span>
+                  <span
+                    className={`font-bold font-mono text-sm ${
+                      smartAuditResult.healthScore === 100
+                        ? 'text-emerald-400'
+                        : smartAuditResult.healthScore >= 75
+                        ? 'text-amber-400'
+                        : 'text-rose-400'
+                    }`}
+                  >
+                    {smartAuditResult.healthScore}%
+                  </span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-black/40 overflow-hidden ring-1 ring-white/10">
+                  <div
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      smartAuditResult.healthScore === 100
+                        ? 'bg-gradient-to-r from-emerald-500 to-teal-400'
+                        : smartAuditResult.healthScore >= 75
+                        ? 'bg-gradient-to-r from-amber-500 to-orange-400'
+                        : 'bg-gradient-to-r from-rose-500 to-pink-500'
+                    }`}
+                    style={{ width: `${smartAuditResult.healthScore}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Body: Issue list or Clean State */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-4 no-scrollbar">
+              {smartAuditResult.albumIssues.length === 0 ? (
+                <div className="py-12 flex flex-col items-center justify-center text-center gap-3">
+                  <div className="w-14 h-14 rounded-full bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shadow-xl shadow-emerald-500/10">
+                    <CheckCircle2 className="w-8 h-8" />
+                  </div>
+                  <h4 className="text-base font-semibold text-white">Thư viện hoàn toàn đồng nhất!</h4>
+                  <p className="text-xs text-zinc-400 max-w-sm">
+                    {t('noIssuesFound')}
+                  </p>
+                </div>
+              ) : (
+                smartAuditResult.albumIssues.map((report) => (
+                  <div
+                    key={report.albumTitle}
+                    className="p-4 rounded-2xl bg-white/[0.03] border border-white/10 flex flex-col gap-2.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Disc className="w-4 h-4 text-amber-400 shrink-0" />
+                        <span className="text-sm font-semibold text-white truncate" title={report.albumTitle}>
+                          {report.albumTitle}
+                        </span>
+                      </div>
+                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-white/10 text-zinc-300 font-mono shrink-0">
+                        {report.tracksCount} {t('tracksCount')}
+                      </span>
+                    </div>
+
+                    <div className="space-y-1.5 pt-1 border-t border-white/5">
+                      {report.issues.map((issue, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-start gap-2 text-xs text-zinc-300 bg-black/25 px-3 py-2 rounded-xl border border-white/5"
+                        >
+                          <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                          <div className="flex-1 min-w-0">
+                            <span className="font-semibold text-amber-300">{issue.title}: </span>
+                            <span className="text-zinc-300">{issue.detail}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 sm:p-6 pt-3 border-t border-white/10 flex items-center justify-between gap-3 bg-black/20">
+              <button
+                onClick={() => setSmartAuditResult(null)}
+                className="px-4 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-300 text-xs sm:text-sm font-medium transition"
+              >
+                {t('cancel')}
+              </button>
+
+              {smartAuditResult.albumIssues.length > 0 && (
+                <button
+                  onClick={handleAutoHarmonizeMetadata}
+                  className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-sky-500 via-sky-600 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white text-xs sm:text-sm font-semibold flex items-center gap-2 shadow-lg shadow-sky-500/25 transition"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>{t('autoHarmonize')}</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Desktop Companion (Mini Player) Overlay */}
+      {isMiniPlayer && (
+        <MiniPlayerOverlay
+          currentTrack={currentTrack}
+          isPlaying={isPlaying}
+          currentTime={currentTime}
+          duration={duration}
+          volume={volume}
+          isMuted={isMuted}
+          onTogglePlayPause={togglePlayPause}
+          onPrevTrack={handlePrevTrack}
+          onNextTrack={() => handleNextTrack(false)}
+          onSeek={handleSeek}
+          onToggleMute={() => setIsMuted((m) => !m)}
+          onVolumeChange={(val) => {
+            setIsMuted(false);
+            setVolume(val);
+          }}
+          alwaysOnTop={alwaysOnTop}
+          onToggleAlwaysOnTop={handleToggleAlwaysOnTop}
+          onExitMiniPlayer={handleExitMiniPlayer}
+          onHideToTray={handleHideToTray}
+          formatTime={formatTime}
+        />
       )}
     </div>
   );
