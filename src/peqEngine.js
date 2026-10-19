@@ -130,6 +130,188 @@ export function validateImportedPresetJson(jsonObj) {
     };
 }
 
+export function isEqualizerApoText(text) {
+    if (typeof text !== 'string') return false;
+    return /^\s*(?:preamp\s*:|filter(?:\s+\d+)?\s*:)/im.test(text);
+}
+
+export function parseEqualizerApoText(text, fallbackName = 'Imported Parametric EQ') {
+    if (!text || typeof text !== 'string') {
+        throw new Error('EQ file content is empty.');
+    }
+
+    const lines = text.split(/\r?\n/);
+    let preamp = 0;
+    let foundPreamp = false;
+    const parsedFilters = [];
+    let detectedName = '';
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        // Check for comment with name/model
+        if (line.startsWith('#') || line.startsWith(';')) {
+            const commentText = line.replace(/^[#;]\s*/, '').trim();
+            if (!detectedName) {
+                const nameMatch = commentText.match(/^(?:Model|Name|Headphone|Profile|Preset|Title)\s*:\s*(.+)$/i);
+                if (nameMatch) {
+                    detectedName = nameMatch[1].trim();
+                } else if (
+                    commentText.length > 2 &&
+                    commentText.length < 50 &&
+                    !commentText.toLowerCase().includes('http') &&
+                    !commentText.toLowerCase().includes('autoeq')
+                ) {
+                    detectedName = commentText;
+                }
+            }
+            continue;
+        }
+
+        // Match Preamp line: e.g. "Preamp: -0.9258 dB" or "Preamp: -3.5 dB"
+        const preampMatch = line.match(/^Preamp\s*:\s*([+-]?[\d.]+)\s*(?:dB)?/i);
+        if (preampMatch) {
+            preamp = parseFloat(preampMatch[1]);
+            foundPreamp = true;
+            continue;
+        }
+
+        // Match Filter line:
+        // Examples:
+        // Filter 1: ON PK Fc 37 Hz Gain -3.5 dB Q 0.5
+        // Filter 2: ON PK Fc 170 Hz Gain 0.9 dB Q 1.4
+        // Filter: ON LSC Fc 105 Hz Gain 5.5 dB Q 0.71
+        const filterMatch = line.match(
+            /^Filter(?:\s+(\d+))?\s*:\s*(ON|OFF)\s+([A-Za-z_]+)\s+Fc\s+([\d.]+)\s*(?:Hz)?(?:\s+Gain\s+([+-]?[\d.]+)\s*(?:dB)?)?(?:\s+Q\s+([\d.]+))?/i
+        );
+
+        if (filterMatch) {
+            const filterIndex = filterMatch[1] ? parseInt(filterMatch[1], 10) : parsedFilters.length + 1;
+            const isOn = filterMatch[2].toUpperCase() === 'ON';
+            const rawType = filterMatch[3].toUpperCase();
+            const freq = parseFloat(filterMatch[4]);
+            const gain = filterMatch[5] !== undefined ? parseFloat(filterMatch[5]) : 0;
+            const q = filterMatch[6] !== undefined
+                ? parseFloat(filterMatch[6])
+                : (rawType.includes('SHELF') || rawType === 'LSC' || rawType === 'HSC' || rawType === 'LS' || rawType === 'HS' ? 0.71 : 1.41);
+
+            let type = 'peaking';
+            if (rawType === 'LSC' || rawType === 'LS' || rawType.includes('LOW_SHELF') || rawType === 'LOWSHELF') {
+                type = 'lowshelf';
+            } else if (rawType === 'HSC' || rawType === 'HS' || rawType.includes('HIGH_SHELF') || rawType === 'HIGHSHELF') {
+                type = 'highshelf';
+            } else if (rawType === 'LP' || rawType === 'LPQ' || rawType.includes('LOW_PASS') || rawType === 'LOWPASS') {
+                type = 'lowpass';
+            } else if (rawType === 'HP' || rawType === 'HPQ' || rawType.includes('HIGH_PASS') || rawType === 'HIGHPASS') {
+                type = 'highpass';
+            }
+
+            parsedFilters.push({
+                index: filterIndex,
+                enabled: isOn,
+                type,
+                frequency: Math.max(20, Math.min(20000, freq)),
+                gain: Math.max(-12, Math.min(12, gain)),
+                q: Math.max(0.1, Math.min(18, q))
+            });
+        }
+    }
+
+    if (!foundPreamp && parsedFilters.length === 0) {
+        throw new Error('No valid Equalizer APO / Parametric EQ filters or preamp found.');
+    }
+
+    // Determine frequencies for remaining bands if fewer than 10 filters provided
+    const lastFilter = parsedFilters.length > 0 ? parsedFilters[parsedFilters.length - 1] : null;
+    const lastFreq = lastFilter ? lastFilter.frequency : 1000;
+    const remainingCount = Math.max(0, 10 - parsedFilters.length);
+
+    let fallbackFrequencies = [];
+    if (remainingCount > 0) {
+        const standardHighs = [62, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000];
+        const higher = standardHighs.filter((f) => f > lastFreq);
+        if (higher.length >= remainingCount) {
+            fallbackFrequencies = higher.slice(0, remainingCount);
+        } else {
+            const start = Math.min(15000, Math.max(lastFreq * 1.3, 1000));
+            const end = 16000;
+            fallbackFrequencies = [];
+            for (let i = 0; i < remainingCount; i++) {
+                const t = (i + 1) / (remainingCount + 1);
+                fallbackFrequencies.push(Math.round(start * Math.pow(end / start, t)));
+            }
+        }
+    }
+
+    // Build exactly 10 bands
+    const bands = [];
+    for (let i = 0; i < 10; i++) {
+        if (i < parsedFilters.length) {
+            const pf = parsedFilters[i];
+            bands.push({
+                id: `band-${i + 1}`,
+                enabled: pf.enabled,
+                type: pf.type,
+                frequency: pf.frequency,
+                gain: Number(pf.gain.toFixed(1)),
+                q: Number(pf.q.toFixed(2))
+            });
+        } else {
+            const fallbackIdx = i - parsedFilters.length;
+            const freq = fallbackFrequencies[fallbackIdx] || DEFAULT_PEQ_FREQUENCIES[i] || 16000;
+            bands.push({
+                id: `band-${i + 1}`,
+                enabled: false,
+                type: i === 9 ? 'highshelf' : 'peaking',
+                frequency: freq,
+                gain: 0,
+                q: i === 9 ? 0.71 : 1.41
+            });
+        }
+    }
+
+    const clampedPreamp = Math.max(-12, Math.min(12, Number.isFinite(preamp) ? Number(preamp.toFixed(1)) : 0));
+    const cleanFallback = String(fallbackName || '')
+        .replace(/\.[^/.]+$/, '')
+        .replace(/[-_]+/g, ' ')
+        .trim();
+    const finalName = detectedName || cleanFallback || 'Imported Parametric EQ';
+
+    return {
+        id: `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: finalName,
+        isBuiltIn: false,
+        preamp: clampedPreamp,
+        bands
+    };
+}
+
+export function exportToEqualizerApoText(peqState, presetName = 'Aurelia Parametric EQ') {
+    const lines = [
+        `# Aurelia Player Parametric EQ Profile: ${presetName}`,
+        `# Exported: ${new Date().toISOString()}`,
+        `Preamp: ${peqState.preamp > 0 ? `+${peqState.preamp.toFixed(1)}` : peqState.preamp.toFixed(1)} dB`
+    ];
+
+    peqState.bands.forEach((band, idx) => {
+        let typeCode = 'PK';
+        if (band.type === 'lowshelf') typeCode = 'LSC';
+        else if (band.type === 'highshelf') typeCode = 'HSC';
+        else if (band.type === 'lowpass') typeCode = 'LP';
+        else if (band.type === 'highpass') typeCode = 'HP';
+
+        const status = band.enabled ? 'ON' : 'OFF';
+        const gainSign = band.gain > 0 ? `+${band.gain.toFixed(1)}` : band.gain.toFixed(1);
+        lines.push(
+            `Filter ${idx + 1}: ${status} ${typeCode} Fc ${Math.round(band.frequency)} Hz Gain ${gainSign} dB Q ${band.q.toFixed(2)}`
+        );
+    });
+
+    return lines.join('\n');
+}
+
+
 /**
  * Applies PEQ parameters to the live Web Audio graph in-place without recreating AudioContext.
  */

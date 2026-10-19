@@ -6787,6 +6787,7 @@ export default function App() {
               onChangeCustomPresets={setCustomPeqPresets}
               filterNodesRef={filterNodesRef}
               showToast={showToast}
+              t={t}
             />
           )}
 
