@@ -1830,9 +1830,27 @@ export default function App() {
   // Smart Metadata Audit State
   const [smartAuditResult, setSmartAuditResult] = useState(null);
 
-  // 10-Band Parametric Equalizer State
-  const [peqState, setPeqState] = useState(() => validateAndNormalizePeqState(null));
-  const [customPeqPresets, setCustomPeqPresets] = useState([]);
+  // 10-Band Parametric Equalizer State with dual-layer localStorage + IndexedDB persistence
+  const [peqState, setPeqState] = useState(() => {
+    try {
+      const saved = localStorage.getItem('aurelia_peq_state');
+      if (saved) {
+        return validateAndNormalizePeqState(JSON.parse(saved));
+      }
+    } catch {}
+    return validateAndNormalizePeqState(null);
+  });
+  const [customPeqPresets, setCustomPeqPresets] = useState(() => {
+    try {
+      const saved = localStorage.getItem('aurelia_custom_peq_presets');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {}
+    return [];
+  });
+  const peqLoadedRef = useRef(false);
   const peqStateRef = useRef(peqState);
   peqStateRef.current = peqState;
   const filterNodesRef = useRef([]);
@@ -2317,15 +2335,44 @@ export default function App() {
         setSettings((prev) => ({ ...prev, ...savedConfig.value }));
       }
 
-      // Restore 10-band PEQ state and custom user presets
+      // Restore 10-band PEQ state and custom user presets with IndexedDB + localStorage synchronization
       const savedPeq = storedSettings.find((s) => s.key === 'peqState');
       if (savedPeq && savedPeq.value) {
-        setPeqState(validateAndNormalizePeqState(savedPeq.value));
+        const normalized = validateAndNormalizePeqState(savedPeq.value);
+        setPeqState(normalized);
+        try {
+          localStorage.setItem('aurelia_peq_state', JSON.stringify(normalized));
+        } catch {}
+      } else {
+        try {
+          const local = localStorage.getItem('aurelia_peq_state');
+          if (local) {
+            const normalized = validateAndNormalizePeqState(JSON.parse(local));
+            setPeqState(normalized);
+            dbPut('settings', { key: 'peqState', value: normalized }).catch(() => {});
+          }
+        } catch {}
       }
+
       const savedCustomPresets = storedSettings.find((s) => s.key === 'customPeqPresets');
-      if (savedCustomPresets && Array.isArray(savedCustomPresets.value)) {
+      if (savedCustomPresets && Array.isArray(savedCustomPresets.value) && savedCustomPresets.value.length > 0) {
         setCustomPeqPresets(savedCustomPresets.value);
+        try {
+          localStorage.setItem('aurelia_custom_peq_presets', JSON.stringify(savedCustomPresets.value));
+        } catch {}
+      } else {
+        try {
+          const local = localStorage.getItem('aurelia_custom_peq_presets');
+          if (local) {
+            const parsed = JSON.parse(local);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setCustomPeqPresets(parsed);
+              dbPut('settings', { key: 'customPeqPresets', value: parsed }).catch(() => {});
+            }
+          }
+        } catch {}
       }
+      peqLoadedRef.current = true;
 
       // Restore remembered music folder record natively without localhost permission prompts
       if (savedFolderRecord) {
@@ -2347,13 +2394,23 @@ export default function App() {
     };
   }, []);
 
-  // Persist PEQ state and custom presets to IndexedDB
+  // Persist PEQ state and custom presets to both localStorage and IndexedDB
   useEffect(() => {
-    dbPut('settings', { key: 'peqState', value: peqState }).catch(() => { });
+    try {
+      localStorage.setItem('aurelia_peq_state', JSON.stringify(peqState));
+    } catch {}
+    if (peqLoadedRef.current) {
+      dbPut('settings', { key: 'peqState', value: peqState }).catch(() => { });
+    }
   }, [peqState]);
 
   useEffect(() => {
-    dbPut('settings', { key: 'customPeqPresets', value: customPeqPresets }).catch(() => { });
+    try {
+      localStorage.setItem('aurelia_custom_peq_presets', JSON.stringify(customPeqPresets));
+    } catch {}
+    if (peqLoadedRef.current) {
+      dbPut('settings', { key: 'customPeqPresets', value: customPeqPresets }).catch(() => { });
+    }
   }, [customPeqPresets]);
 
   useEffect(() => {

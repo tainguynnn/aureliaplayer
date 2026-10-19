@@ -148,11 +148,20 @@ function PeqPanel({
 
     const handleBandChange = (idx, patch) => {
         const nextBands = peqState.bands.map((b, i) => (i === idx ? { ...b, ...patch } : b));
-        onChangePeqState({
+        const updatedPeq = {
             ...peqState,
             activePresetId: activePreset && !activePreset.isBuiltIn ? activePreset.id : 'custom',
             bands: nextBands
-        });
+        };
+        onChangePeqState(updatedPeq);
+
+        // Auto-sync custom preset so tweaks are preserved immediately
+        if (activePreset && !activePreset.isBuiltIn) {
+            const nextCustom = (customPresets || []).map((p) =>
+                p.id === activePreset.id ? { ...p, bands: nextBands } : p
+            );
+            onChangeCustomPresets(nextCustom);
+        }
     };
 
     const handleGainStep = (idx, delta) => {
@@ -164,22 +173,34 @@ function PeqPanel({
 
     const handlePreampStep = (delta) => {
         const nextPreamp = Math.max(-12, Math.min(12, Number((peqState.preamp + delta).toFixed(1))));
-        onChangePeqState({
+        const updatedPeq = {
             ...peqState,
             preamp: nextPreamp
-        });
+        };
+        onChangePeqState(updatedPeq);
+
+        if (activePreset && !activePreset.isBuiltIn) {
+            const nextCustom = (customPresets || []).map((p) =>
+                p.id === activePreset.id ? { ...p, preamp: nextPreamp } : p
+            );
+            onChangeCustomPresets(nextCustom);
+        }
     };
 
     const handleSaveNewPreset = () => {
-        const name = (presetNameInput || 'Custom PEQ').trim();
+        const name = (presetNameInput || (activePreset ? `${activePreset.name} (Custom)` : 'Custom PEQ')).trim();
         const newPreset = {
-            id: `custom-${Date.now()}`,
+            id: `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             name,
             isBuiltIn: false,
             preamp: peqState.preamp,
             bands: peqState.bands.map((b) => ({ ...b }))
         };
         const nextCustom = [...(customPresets || []), newPreset];
+        try {
+            localStorage.setItem('aurelia_custom_peq_presets', JSON.stringify(nextCustom));
+            localStorage.setItem('aurelia_peq_state', JSON.stringify({ ...peqState, activePresetId: newPreset.id }));
+        } catch {}
         onChangeCustomPresets(nextCustom);
         onChangePeqState({ ...peqState, activePresetId: newPreset.id });
         setPresetNameInput('');
@@ -198,6 +219,9 @@ function PeqPanel({
                 }
                 : p
         );
+        try {
+            localStorage.setItem('aurelia_custom_peq_presets', JSON.stringify(nextCustom));
+        } catch {}
         onChangeCustomPresets(nextCustom);
         setPresetNameInput('');
         showToast(`Updated preset "${activePreset.name}"`, 'success');
@@ -206,13 +230,18 @@ function PeqPanel({
     const handleDuplicatePreset = () => {
         const baseName = activePreset ? `${activePreset.name} (Copy)` : 'Custom PEQ Copy';
         const dup = {
-            id: `custom-${Date.now()}`,
+            id: `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             name: baseName,
             isBuiltIn: false,
             preamp: peqState.preamp,
             bands: peqState.bands.map((b) => ({ ...b }))
         };
-        onChangeCustomPresets([...(customPresets || []), dup]);
+        const nextCustom = [...(customPresets || []), dup];
+        try {
+            localStorage.setItem('aurelia_custom_peq_presets', JSON.stringify(nextCustom));
+            localStorage.setItem('aurelia_peq_state', JSON.stringify({ ...peqState, activePresetId: dup.id }));
+        } catch {}
+        onChangeCustomPresets(nextCustom);
         onChangePeqState({ ...peqState, activePresetId: dup.id });
         showToast(`Duplicated as "${baseName}"`, 'info');
     };
@@ -220,6 +249,9 @@ function PeqPanel({
     const handleDeletePreset = () => {
         if (!activePreset || activePreset.isBuiltIn) return;
         const nextCustom = (customPresets || []).filter((p) => p.id !== activePreset.id);
+        try {
+            localStorage.setItem('aurelia_custom_peq_presets', JSON.stringify(nextCustom));
+        } catch {}
         onChangeCustomPresets(nextCustom);
         handleSelectPreset('builtin-flat');
         showToast(`Deleted preset "${activePreset.name}"`, 'info');
@@ -283,14 +315,21 @@ function PeqPanel({
         }
 
         const nextCustom = [...(customPresets || []), validated];
-        onChangeCustomPresets(nextCustom);
-        onChangePeqState({
+        const nextPeqState = {
             ...peqState,
             enabled: true,
             activePresetId: validated.id,
             preamp: validated.preamp,
             bands: validated.bands
-        });
+        };
+
+        try {
+            localStorage.setItem('aurelia_custom_peq_presets', JSON.stringify(nextCustom));
+            localStorage.setItem('aurelia_peq_state', JSON.stringify(nextPeqState));
+        } catch {}
+
+        onChangeCustomPresets(nextCustom);
+        onChangePeqState(nextPeqState);
 
         setIsImportModalOpen(false);
         setPasteText('');
@@ -698,20 +737,43 @@ function PeqPanel({
                             max={12}
                             step={0.1}
                             value={peqState.preamp}
-                            onDoubleClick={() => onChangePeqState({ ...peqState, preamp: 0 })}
-                            onChange={(e) =>
-                                onChangePeqState({
-                                    ...peqState,
-                                    preamp: parseFloat(e.target.value)
-                                })
-                            }
+                            onDoubleClick={() => {
+                                const updated = { ...peqState, preamp: 0 };
+                                onChangePeqState(updated);
+                                if (activePreset && !activePreset.isBuiltIn) {
+                                    const nextCustom = (customPresets || []).map((p) =>
+                                        p.id === activePreset.id ? { ...p, preamp: 0 } : p
+                                    );
+                                    onChangeCustomPresets(nextCustom);
+                                }
+                            }}
+                            onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                const updated = { ...peqState, preamp: val };
+                                onChangePeqState(updated);
+                                if (activePreset && !activePreset.isBuiltIn) {
+                                    const nextCustom = (customPresets || []).map((p) =>
+                                        p.id === activePreset.id ? { ...p, preamp: val } : p
+                                    );
+                                    onChangeCustomPresets(nextCustom);
+                                }
+                            }}
                             className="w-full h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer accent-amber-400"
                         />
                         <div className="flex justify-between text-[10px] font-mono text-zinc-500 mt-1">
                             <span>-12 dB</span>
                             <button
                                 type="button"
-                                onClick={() => onChangePeqState({ ...peqState, preamp: 0 })}
+                                onClick={() => {
+                                    const updated = { ...peqState, preamp: 0 };
+                                    onChangePeqState(updated);
+                                    if (activePreset && !activePreset.isBuiltIn) {
+                                        const nextCustom = (customPresets || []).map((p) =>
+                                            p.id === activePreset.id ? { ...p, preamp: 0 } : p
+                                        );
+                                        onChangeCustomPresets(nextCustom);
+                                    }
+                                }}
                                 className="hover:text-amber-300 transition"
                                 title="Reset Preamp to 0 dB"
                             >
