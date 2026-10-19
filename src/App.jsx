@@ -407,7 +407,10 @@ function buildAlbumIdentityKey(albumTitle, albumArtist, fallbackFolderPath = '')
   const hasValidArtist = normArtist && normArtist !== 'unknown artist';
 
   if (hasValidAlbum) {
-    const scopeKey = hasValidArtist ? normArtist : normFolder || 'general';
+    if (normFolder) {
+      return `alb::${normAlbum}::fld::${normFolder}`;
+    }
+    const scopeKey = hasValidArtist ? normArtist : 'general';
     return `alb::${normAlbum}::${scopeKey}`;
   }
   if (normFolder) {
@@ -599,7 +602,29 @@ function parseNumberAndTotal(rawVal) {
 }
 
 async function parseBinaryAudioMetadata(file, relativePath = '') {
-  const pathHints = inferMetadataFromRelativePath(relativePath || file.webkitRelativePath || file.name, file.name);
+  const fullFilePath = String(file.filePath || file.nativePath || '').replace(/\\/g, '/');
+  const nativeDir = fullFilePath.includes('/') ? fullFilePath.slice(0, fullFilePath.lastIndexOf('/')) : '';
+  let effectiveRelPath = (relativePath || file.webkitRelativePath || file.name || '').replace(/\\/g, '/');
+  if (!effectiveRelPath.includes('/') && nativeDir) {
+    const dirLeaf = nativeDir.split('/').filter(Boolean).pop() || '';
+    if (dirLeaf) {
+      effectiveRelPath = `${dirLeaf}/${file.name}`;
+    }
+  }
+
+  const pathHints = inferMetadataFromRelativePath(effectiveRelPath, file.name);
+  const effectiveFolderPath = pathHints.folderPath || file.folderPath || nativeDir || '';
+  if (!pathHints.folderPath && effectiveFolderPath) {
+    pathHints.folderPath = effectiveFolderPath;
+  }
+  if ((!pathHints.album || pathHints.album === 'Unknown Track') && effectiveFolderPath) {
+    const folderLeaf = effectiveFolderPath.split('/').filter(Boolean).pop();
+    if (folderLeaf) {
+      pathHints.album = folderLeaf;
+      if (!pathHints.sourceRootFolder) pathHints.sourceRootFolder = folderLeaf;
+    }
+  }
+
   const fieldSources = {};
   if (pathHints.title) fieldSources.title = 'Path Inferred';
   if (pathHints.artist) fieldSources.artist = 'Path Inferred';
@@ -618,8 +643,8 @@ async function parseBinaryAudioMetadata(file, relativePath = '') {
     totalTracks: null,
     discNumber: pathHints.discNumber || 1,
     totalDiscs: null,
-    folderPath: pathHints.folderPath || '',
-    sourceRootFolder: pathHints.sourceRootFolder || '',
+    folderPath: effectiveFolderPath,
+    sourceRootFolder: pathHints.sourceRootFolder || (effectiveFolderPath ? effectiveFolderPath.split('/')[0] : ''),
     relativePath: pathHints.relativePath || file.name,
     year: '',
     releaseDate: '',
@@ -2007,7 +2032,12 @@ export default function App() {
     () =>
       [0, 1].map((idx) => (el) => {
         deckElsRef.current[idx] = el;
-        if (el && idx === 0 && !audioRef.current) audioRef.current = el;
+        if (el) {
+          try {
+            el.crossOrigin = 'anonymous';
+          } catch { }
+          if (idx === 0 && !audioRef.current) audioRef.current = el;
+        }
       }),
     []
   );
@@ -2017,6 +2047,7 @@ export default function App() {
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const sourceNodeRef = useRef(null);
+  const connectedMediaElementsRef = useRef(new WeakSet());
   const eqLowRef = useRef(null);
   const eqMidRef = useRef(null);
   const eqHighRef = useRef(null);
@@ -2262,9 +2293,11 @@ export default function App() {
           typeof saved.coverUrl === 'string' &&
           (saved.coverUrl.startsWith('data:') || saved.coverUrl.startsWith('http'));
         const pathMeta = inferMetadataFromRelativePath(saved.relativePath || saved.title || '', saved.title || '');
+        const fullSavedPath = String(saved.filePath || '').replace(/\\/g, '/');
+        const nativeSavedDir = fullSavedPath.includes('/') ? fullSavedPath.slice(0, fullSavedPath.lastIndexOf('/')) : '';
+        const resolvedFolderPath = saved.folderPath || pathMeta.folderPath || nativeSavedDir || '';
         const resolvedAlbum = saved.album || pathMeta.album || 'Unsorted Local Album';
         const resolvedAlbumArtist = saved.albumArtist || saved.artist || pathMeta.artist || 'Unknown Artist';
-        const resolvedFolderPath = saved.folderPath ?? pathMeta.folderPath ?? '';
         const resolvedAlbumId = buildAlbumIdentityKey(resolvedAlbum, resolvedAlbumArtist, resolvedFolderPath);
 
         const dedupKey = buildCanonicalTrackDedupKey(
@@ -2792,6 +2825,19 @@ export default function App() {
       if (audioCtxRef.current.state === 'suspended') {
         audioCtxRef.current.resume().catch(() => { });
       }
+      if (preampGainRef.current) {
+        deckElsRef.current.filter(Boolean).forEach((el) => {
+          if (!connectedMediaElementsRef.current.has(el)) {
+            try {
+              const src = audioCtxRef.current.createMediaElementSource(el);
+              src.connect(preampGainRef.current);
+              connectedMediaElementsRef.current.add(el);
+            } catch (err) {
+              console.warn('Audio deck reconnect notice:', err);
+            }
+          }
+        });
+      }
       return;
     }
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -2813,12 +2859,19 @@ export default function App() {
       });
 
       // Both decks feed the same Preamp -> 10-Band EQ -> Analyser -> Output chain
-      const sources = deckElsRef.current.filter(Boolean).map((el) => {
-        const src = ctx.createMediaElementSource(el);
-        src.connect(preampGain);
-        return src;
+      let firstSource = null;
+      deckElsRef.current.filter(Boolean).forEach((el) => {
+        if (!connectedMediaElementsRef.current.has(el)) {
+          try {
+            const src = ctx.createMediaElementSource(el);
+            src.connect(preampGain);
+            connectedMediaElementsRef.current.add(el);
+            if (!firstSource) firstSource = src;
+          } catch (err) {
+            console.warn('Audio deck initial connect notice:', err);
+          }
+        }
       });
-      const source = sources[0];
 
       preampGain.connect(filterNodes[0]);
       for (let i = 0; i < filterNodes.length - 1; i++) {
@@ -2829,7 +2882,7 @@ export default function App() {
 
       audioCtxRef.current = ctx;
       analyserRef.current = analyser;
-      sourceNodeRef.current = source;
+      sourceNodeRef.current = firstSource;
       preampGainRef.current = preampGain;
       filterNodesRef.current = filterNodes;
 
@@ -2957,10 +3010,17 @@ export default function App() {
           ctx.clearRect(0, 0, width, height);
 
           // Create gradient ONCE per canvas outside bar loop
+          const isLight = document.documentElement.classList.contains('light-theme');
           const grad = ctx.createLinearGradient(0, height, 0, 0);
-          grad.addColorStop(0, `rgba(${r500}, 0.22)`);
-          grad.addColorStop(0.6, `rgba(${r400}, 0.68)`);
-          grad.addColorStop(1, `rgba(${r300}, 0.92)`);
+          if (isLight) {
+            grad.addColorStop(0, `rgba(${r500}, 0.45)`);
+            grad.addColorStop(0.6, `rgba(${r500}, 0.85)`);
+            grad.addColorStop(1, `rgba(${r400}, 1.0)`);
+          } else {
+            grad.addColorStop(0, `rgba(${r500}, 0.22)`);
+            grad.addColorStop(0.6, `rgba(${r400}, 0.68)`);
+            grad.addColorStop(1, `rgba(${r300}, 0.92)`);
+          }
           ctx.fillStyle = grad;
 
           const barCount = 52;
@@ -3007,6 +3067,11 @@ export default function App() {
     const startElementPlayback = async () => {
       if (cancelled || !audioRef.current) return;
       ensureAudioGraph();
+      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+        try {
+          await audioCtxRef.current.resume();
+        } catch { }
+      }
       try {
         await audioRef.current.play();
         if (!cancelled) {
@@ -3040,6 +3105,9 @@ export default function App() {
       if (preloadedDeck) {
         audio = preloadedDeck;
       } else {
+        if (audio.crossOrigin !== 'anonymous') {
+          audio.crossOrigin = 'anonymous';
+        }
         audio.src = currentTrack.objectUrl;
         audio.load();
       }
@@ -3111,6 +3179,9 @@ export default function App() {
     }
 
     ensureAudioGraph();
+    if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume().catch(() => { });
+    }
 
     if (audio.paused) {
       try {
@@ -3340,6 +3411,9 @@ export default function App() {
       return undefined;
     }
     if (el.src !== next.objectUrl) {
+      if (el.crossOrigin !== 'anonymous') {
+        el.crossOrigin = 'anonymous';
+      }
       el.preload = 'auto';
       el.src = next.objectUrl;
       el.load();
@@ -3523,11 +3597,21 @@ export default function App() {
 
           const normFolder = normalizeAlbumFolderRoot(t.folderPath);
           if (normFolder && t.album && t.album !== 'Unsorted Local Album') {
-            folderAlbumConsensus.set(normFolder, {
-              album: t.album,
-              albumArtist: t.albumArtist || t.artist || 'Unknown Artist',
-              albumId: t.albumId || buildAlbumIdentityKey(t.album, t.albumArtist || t.artist, t.folderPath)
-            });
+            const consensusKey = `${normFolder}:::${normalizeIdentityText(t.album)}`;
+            const existing = folderAlbumConsensus.get(consensusKey);
+            if (!existing) {
+              folderAlbumConsensus.set(consensusKey, {
+                album: t.album,
+                albumArtist: t.albumArtist || 'Various Artists',
+                albumId: t.albumId || buildAlbumIdentityKey(t.album, t.albumArtist || t.artist, t.folderPath),
+                artists: new Set(t.artist ? [t.artist] : [])
+              });
+            } else if (t.artist) {
+              existing.artists.add(t.artist);
+              if (existing.artists.size > 1 && !t.albumArtist) {
+                existing.albumArtist = 'Various Artists';
+              }
+            }
           }
         }
       });
@@ -3570,21 +3654,29 @@ export default function App() {
         // Reconcile folder-level album identity so tracks in the same album folder share a consistent albumArtist & albumId
         const normFolder = normalizeAlbumFolderRoot(meta.folderPath);
         if (normFolder) {
-          const existingConsensus = folderAlbumConsensus.get(normFolder);
+          const consensusKey = `${normFolder}:::${normalizeIdentityText(meta.album || '')}`;
+          const existingConsensus = folderAlbumConsensus.get(consensusKey);
           const hasEmbeddedAlbum = meta.albumSource && meta.albumSource.startsWith('Embedded');
           if (existingConsensus) {
             if (!hasEmbeddedAlbum || normalizeIdentityText(meta.album) === normalizeIdentityText(existingConsensus.album)) {
               meta.album = existingConsensus.album;
-              meta.albumArtist = existingConsensus.albumArtist;
               meta.albumId = existingConsensus.albumId;
+              if (existingConsensus.artists) existingConsensus.artists.add(meta.artist);
+              if (existingConsensus.artists && existingConsensus.artists.size > 1 && (!meta.albumArtist || meta.albumArtist === 'Unknown Artist')) {
+                meta.albumArtist = 'Various Artists';
+                existingConsensus.albumArtist = 'Various Artists';
+              } else if (existingConsensus.albumArtist) {
+                meta.albumArtist = existingConsensus.albumArtist;
+              }
             }
           } else if (meta.album && meta.album !== 'Unsorted Local Album') {
             const consensusAlbumId = buildAlbumIdentityKey(meta.album, meta.albumArtist, meta.folderPath);
             meta.albumId = consensusAlbumId;
-            folderAlbumConsensus.set(normFolder, {
+            folderAlbumConsensus.set(consensusKey, {
               album: meta.album,
               albumArtist: meta.albumArtist || meta.artist || 'Unknown Artist',
-              albumId: consensusAlbumId
+              albumId: consensusAlbumId,
+              artists: new Set(meta.artist ? [meta.artist] : [])
             });
           }
         }
@@ -3650,6 +3742,7 @@ export default function App() {
             const probedDuration = await new Promise((resolve) => {
               const tempAudio = document.createElement('audio');
               tempAudio.preload = 'metadata';
+              tempAudio.crossOrigin = 'anonymous';
               const timer = setTimeout(() => resolve(0), 1400);
               tempAudio.onloadedmetadata = () => {
                 clearTimeout(timer);
@@ -3889,17 +3982,26 @@ export default function App() {
             headerBlob = new Blob([]);
           }
 
+          const normNativePath = (item.path || '').replace(/\\/g, '/');
+          const fileDir = normNativePath.includes('/') ? normNativePath.slice(0, normNativePath.lastIndexOf('/')) : '';
+
           const fileProxy = {
             name: item.name,
             size: Number(item.size),
             type: mimeMap[extLower] || 'audio/mpeg',
             filePath: item.path,
+            folderPath: fileDir,
             slice: (start, end) => headerBlob.slice(start, end)
           };
 
+          let effectiveRelPath = (item.relative_path || item.name || '').replace(/\\/g, '/');
+          if (!effectiveRelPath.includes('/') && folderName) {
+            effectiveRelPath = `${folderName}/${effectiveRelPath}`;
+          }
+
           rawEntries.push({
             file: fileProxy,
-            relativePath: item.relative_path,
+            relativePath: effectiveRelPath,
             nativePath: item.path
           });
         }
@@ -4399,7 +4501,11 @@ export default function App() {
         if (art) artistCounts.set(art, (artistCounts.get(art) || 0) + 1);
       }
       const dominantArtist =
-        artistCounts.size > 0 ? [...artistCounts.entries()].sort((a, b) => b[1] - a[1])[0][0] : null;
+        artistCounts.size > 0
+          ? (artistCounts.size > 1 && [...artistCounts.values()].every((v) => v <= list.length / 2)
+              ? 'Various Artists'
+              : [...artistCounts.entries()].sort((a, b) => b[1] - a[1])[0][0])
+          : null;
 
       const yearCounts = new Map();
       for (const t of list) {
@@ -4881,7 +4987,7 @@ export default function App() {
   const groupedAlbums = useMemo(() => {
     const map = new Map();
     for (const t of filteredTracks) {
-      const key = t.albumId || buildAlbumIdentityKey(t.album, t.albumArtist || t.artist, t.folderPath);
+      const key = buildAlbumIdentityKey(t.album, t.albumArtist, t.folderPath);
       if (!map.has(key)) {
         map.set(key, {
           id: key,
@@ -4894,6 +5000,7 @@ export default function App() {
           sourceRootFolder: t.sourceRootFolder || '',
           albumSource: t.albumSource || 'Metadata / Folder',
           codecs: new Set(),
+          artists: new Set(),
           totalDuration: 0,
           isBuiltInReference: Boolean(t.isBuiltInReference),
           tracks: []
@@ -4902,6 +5009,7 @@ export default function App() {
       const entry = map.get(key);
       entry.tracks.push(t);
       entry.totalDuration += t.duration || 0;
+      if (t.artist && t.artist !== 'Unknown Artist') entry.artists.add(t.artist);
       if (t.codec) entry.codecs.add(t.codec.split(' ')[0]);
       if (!entry.isArtworkVerified && t.isArtworkVerified && t.coverUrl) {
         entry.coverUrl = t.coverUrl;
@@ -4909,13 +5017,23 @@ export default function App() {
       }
       if (!entry.year && t.year) entry.year = t.year;
       if (!entry.folderPath && t.folderPath) entry.folderPath = t.folderPath;
+      if (t.albumArtist && t.albumArtist !== 'Unknown Artist' && !entry.explicitAlbumArtist) {
+        entry.explicitAlbumArtist = t.albumArtist;
+      }
     }
 
-    const albumsArray = Array.from(map.values()).map((alb) => ({
-      ...alb,
-      codecsList: Array.from(alb.codecs),
-      tracks: sortTracksForAlbum(alb.tracks)
-    }));
+    const albumsArray = Array.from(map.values()).map((alb) => {
+      let displayArtist = alb.explicitAlbumArtist || alb.artist;
+      if (alb.artists.size > 1 && (!alb.explicitAlbumArtist || alb.explicitAlbumArtist === 'Unknown Artist')) {
+        displayArtist = 'Various Artists';
+      }
+      return {
+        ...alb,
+        artist: displayArtist,
+        codecsList: Array.from(alb.codecs),
+        tracks: sortTracksForAlbum(alb.tracks)
+      };
+    });
 
     albumsArray.sort((a, b) => {
       if (a.isBuiltInReference !== b.isBuiltInReference) {
@@ -4944,12 +5062,13 @@ export default function App() {
       const found = groupedAlbums.find((a) => a.id === selectedAlbumId);
       if (found) return found;
     }
-    if (currentTrack?.albumId) {
-      const currentAlb = groupedAlbums.find((a) => a.id === currentTrack.albumId);
+    if (currentTrack) {
+      const currentKey = buildAlbumIdentityKey(currentTrack.album, currentTrack.albumArtist, currentTrack.folderPath);
+      const currentAlb = groupedAlbums.find((a) => a.id === currentKey || (currentTrack.albumId && a.id === currentTrack.albumId));
       if (currentAlb) return currentAlb;
     }
     return groupedAlbums[0];
-  }, [groupedAlbums, selectedAlbumId, currentTrack?.albumId]);
+  }, [groupedAlbums, selectedAlbumId, currentTrack]);
 
   const handlePlayAlbum = useCallback(
     (album, startTrackId = null) => {
@@ -5132,6 +5251,8 @@ export default function App() {
         <audio
           key={deckIdx}
           ref={deckRefCallbacks[deckIdx]}
+          crossOrigin="anonymous"
+          preload="auto"
           onTimeUpdate={handleDeckTimeUpdate}
           onLoadedMetadata={(e) => {
             if (e.currentTarget !== audioRef.current) return;
@@ -5306,7 +5427,7 @@ export default function App() {
           data-tauri-drag-region
           style={DRAG_STYLE}
           onDoubleClick={handleTitleBarDoubleClick}
-          className="pywebview-drag-region relative flex items-center justify-between gap-3 px-4 lg:px-8 h-10 overflow-hidden select-none md:grid md:grid-cols-[auto_minmax(0,28rem)_auto] bg-gradient-to-r from-amber-500/[0.05] via-transparent to-amber-500/[0.05] border-b border-white/[0.05]"
+          className="pywebview-drag-region relative flex items-center justify-between gap-3 px-4 lg:px-8 h-10 overflow-hidden select-none md:grid md:grid-cols-[auto_minmax(0,28rem)_auto] bg-gradient-to-r from-amber-500/[0.05] via-transparent to-amber-500/[0.05] border-b border-black/5 dark:border-white/[0.05]"
         >
           {/* Brand Logo Only */}
           <div className="pointer-events-none flex items-center min-w-0">
@@ -5316,20 +5437,20 @@ export default function App() {
           </div>
 
           {/* Now playing (compact title on phones, Interactive Dynamic Island from md up) */}
-          <span className="pointer-events-none md:hidden flex-1 min-w-0 truncate text-xs text-zinc-400 text-right">
+          <span className="pointer-events-none md:hidden flex-1 min-w-0 truncate text-xs text-zinc-600 dark:text-zinc-400 text-right">
             {currentTrack ? currentTrack.title : ''}
           </span>
           <div className="hidden md:flex items-center justify-center min-w-0">
             <div
               style={NO_DRAG_STYLE}
-              className="group pointer-events-auto flex items-center gap-2.5 max-w-full min-w-0 px-3.5 py-1 rounded-full transition-all duration-300 ease-out shadow-lg bg-black/30 dark:bg-black/40 border border-white/10 shadow-inner shadow-black/40 hover:bg-zinc-900/95 dark:hover:bg-black/90 hover:border-amber-500/40 hover:shadow-amber-500/10 hover:scale-[1.02]"
+              className="group pointer-events-auto flex items-center gap-2.5 max-w-full min-w-0 px-3.5 py-1 rounded-full transition-all duration-300 ease-out shadow-sm bg-white/90 dark:bg-black/40 border border-slate-200 dark:border-white/10 hover:bg-white dark:hover:bg-black/90 hover:border-amber-500/40 hover:shadow-amber-500/10 hover:scale-[1.02]"
             >
               {/* Soundwave Visualizer Bars */}
               <span className="flex items-end gap-[3px] h-3.5 shrink-0" aria-hidden="true">
                 {[0, 1, 2, 3].map((i) => (
                   <span
                     key={i}
-                    className={`w-[3px] h-full rounded-full origin-bottom ${currentTrack ? '' : 'bg-zinc-600'}`}
+                    className={`w-[3px] h-full rounded-full origin-bottom ${currentTrack ? '' : 'bg-zinc-400 dark:bg-zinc-600'}`}
                     style={{
                       backgroundColor: currentTrack ? activePalette.hex400 : undefined,
                       ...(isPlaying
@@ -5342,24 +5463,24 @@ export default function App() {
 
               {/* Track Title & Artist */}
               <div className="min-w-0 flex items-baseline gap-1.5 max-w-[200px] lg:max-w-[280px]">
-                <span className={`truncate text-xs font-semibold ${currentTrack ? 'text-zinc-100' : 'text-zinc-500'}`}>
+                <span className={`truncate text-xs font-semibold ${currentTrack ? 'text-zinc-800 dark:text-zinc-100' : 'text-zinc-400 dark:text-zinc-500'}`}>
                   {currentTrack ? currentTrack.title : t('nothingPlaying')}
                 </span>
                 {currentTrack?.artist && (
-                  <span className="hidden sm:inline truncate text-[11px] text-zinc-400">
+                  <span className="hidden sm:inline truncate text-[11px] text-zinc-500 dark:text-zinc-400">
                     • {currentTrack.artist}
                   </span>
                 )}
               </div>
 
               {/* Quick Hover Controls (Previous, Play/Pause, Next, Mini Player Toggle) */}
-              <div className="flex items-center gap-1 transition-all duration-300 ease-out overflow-hidden opacity-0 max-w-0 pointer-events-none group-hover:opacity-100 group-hover:max-w-[140px] group-hover:pointer-events-auto group-hover:ml-1 group-hover:pl-1.5 group-hover:border-l group-hover:border-white/15">
+              <div className="flex items-center gap-1 transition-all duration-300 ease-out overflow-hidden opacity-0 max-w-0 pointer-events-none group-hover:opacity-100 group-hover:max-w-[140px] group-hover:pointer-events-auto group-hover:ml-1 group-hover:pl-1.5 group-hover:border-l group-hover:border-black/10 dark:group-hover:border-white/15">
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     handlePrevTrack();
                   }}
-                  className="p-1 rounded-full hover:bg-white/10 text-zinc-300 hover:text-white transition"
+                  className="p-1 rounded-full hover:bg-black/5 dark:hover:bg-white/10 text-zinc-600 dark:text-zinc-300 hover:text-zinc-950 dark:hover:text-white transition"
                   title={t('prevTrack')}
                 >
                   <SkipBack className="w-3 h-3" />
@@ -5379,7 +5500,7 @@ export default function App() {
                     e.stopPropagation();
                     handleNextTrack(false);
                   }}
-                  className="p-1 rounded-full hover:bg-white/10 text-zinc-300 hover:text-white transition"
+                  className="p-1 rounded-full hover:bg-black/5 dark:hover:bg-white/10 text-zinc-600 dark:text-zinc-300 hover:text-zinc-950 dark:hover:text-white transition"
                   title={t('nextTrack')}
                 >
                   <SkipForward className="w-3 h-3" />
@@ -5393,11 +5514,11 @@ export default function App() {
             {showWindowControls && (
               <div
                 style={NO_DRAG_STYLE}
-                className="pointer-events-auto flex self-stretch ml-1 -mr-4 lg:-mr-8 border-l border-white/[0.06]"
+                className="pointer-events-auto flex self-stretch ml-1 -mr-4 lg:-mr-8 border-l border-black/5 dark:border-white/[0.06]"
               >
                 <button
                   onClick={() => runWindowAction('minimize')}
-                  className="w-11 sm:w-[46px] h-full flex items-center justify-center text-zinc-300 hover:text-white hover:bg-white/10 transition-colors"
+                  className="w-11 sm:w-[46px] h-full flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:text-zinc-950 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
                   title="Minimize"
                   aria-label="Minimize window"
                 >
@@ -5407,7 +5528,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => runWindowAction('toggleMaximize')}
-                  className="w-11 sm:w-[46px] h-full flex items-center justify-center text-zinc-300 hover:text-white hover:bg-white/10 transition-colors"
+                  className="w-11 sm:w-[46px] h-full flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:text-zinc-950 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
                   title={isWinMaximized ? 'Restore' : 'Maximize'}
                   aria-label={isWinMaximized ? 'Restore window' : 'Maximize window'}
                 >
@@ -5424,7 +5545,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => runWindowAction('close')}
-                  className="w-11 sm:w-[46px] h-full flex items-center justify-center text-zinc-300 hover:text-white hover:bg-red-600 transition-colors"
+                  className="w-11 sm:w-[46px] h-full flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:text-white hover:bg-red-600 transition-colors"
                   title="Close"
                   aria-label="Close window"
                 >
@@ -5442,7 +5563,7 @@ export default function App() {
 
         {/* Navigation + import row */}
         <div className="px-4 lg:px-8 py-2 flex flex-wrap items-center justify-between gap-3">
-          <nav className="flex items-center gap-1 bg-white/[0.03] p-1 rounded-xl border border-white/[0.07] overflow-x-auto max-w-full no-scrollbar">
+          <nav className="flex items-center gap-1 bg-white/70 dark:bg-white/[0.03] p-1 rounded-xl border border-slate-200 dark:border-white/[0.07] overflow-x-auto max-w-full no-scrollbar shadow-xs">
             {[
               { id: 'library', label: t('library'), icon: Music },
               { id: 'equalizer', label: t('equalizer') || 'Equalizer', icon: SlidersHorizontal },
@@ -5456,8 +5577,8 @@ export default function App() {
                   key={item.id}
                   onClick={() => setActiveTab(item.id)}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all whitespace-nowrap ${active
-                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
+                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-300 border border-amber-500/30'
+                    : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 hover:bg-slate-100 dark:hover:bg-white/5'
                     }`}
                 >
                   <Icon className="w-3.5 h-3.5" />
@@ -5471,7 +5592,7 @@ export default function App() {
             {/* Quick Dark / Light Mode Toggle */}
             <button
               onClick={() => updateSetting('themeMode', settings.themeMode === 'light' ? 'dark' : 'light')}
-              className="p-2 rounded-xl border border-white/10 bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 hover:text-white transition"
+              className="p-2 rounded-xl border border-slate-200 dark:border-white/10 bg-white/70 dark:bg-white/[0.04] hover:bg-slate-100 dark:hover:bg-white/[0.08] text-zinc-700 dark:text-zinc-300 hover:text-zinc-950 dark:hover:text-white transition shadow-xs"
               title={settings.themeMode === 'light' ? t('darkMode') : t('lightMode')}
               aria-label={settings.themeMode === 'light' ? t('darkMode') : t('lightMode')}
             >
@@ -5487,8 +5608,8 @@ export default function App() {
               <button
                 onClick={() => setShowColorPickerPopover((prev) => !prev)}
                 className={`p-2 rounded-xl border transition flex items-center justify-center gap-1.5 ${showColorPickerPopover
-                  ? 'bg-white/10 border-white/20 text-white shadow-sm'
-                  : 'bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 border-white/10'
+                  ? 'bg-slate-100 dark:bg-white/10 border-slate-300 dark:border-white/20 text-zinc-900 dark:text-white shadow-sm'
+                  : 'bg-white/70 dark:bg-white/[0.04] hover:bg-slate-100 dark:hover:bg-white/[0.08] text-zinc-700 dark:text-zinc-300 border-slate-200 dark:border-white/10 shadow-xs'
                   }`}
                 title={t('accentColorQuick')}
                 aria-label={t('accentColorQuick')}
@@ -5497,11 +5618,11 @@ export default function App() {
                   className="w-3.5 h-3.5 rounded-full ring-2 ring-white/20 shadow-sm transition-transform hover:scale-110 shrink-0"
                   style={{ backgroundColor: activePalette.swatch }}
                 />
-                <ChevronDown className={`w-3 h-3 text-zinc-400 transition-transform duration-200 ${showColorPickerPopover ? 'rotate-180 text-white' : ''}`} />
+                <ChevronDown className={`w-3 h-3 text-zinc-500 dark:text-zinc-400 transition-transform duration-200 ${showColorPickerPopover ? 'rotate-180 text-zinc-900 dark:text-white' : ''}`} />
               </button>
 
               {showColorPickerPopover && (
-                <div className="absolute right-0 top-full mt-2.5 z-50 p-2 rounded-2xl bg-zinc-950/90 border border-white/10 shadow-2xl backdrop-blur-2xl flex items-center gap-1.5 animate-in fade-in zoom-in-95 duration-150">
+                <div className="absolute right-0 top-full mt-2.5 z-50 p-2 rounded-2xl bg-white dark:bg-zinc-950/90 border border-slate-200 dark:border-white/10 shadow-2xl backdrop-blur-2xl flex items-center gap-1.5 animate-in fade-in zoom-in-95 duration-150">
                   {/* Preset Color Dots */}
                   {Object.values(ACCENT_PALETTES).map((pal) => {
                     const isSelected = settings.accentColor === pal.id;
@@ -5646,8 +5767,9 @@ export default function App() {
                 </h1>
                 <p
                   onClick={() => {
-                    if (currentTrack?.albumId) {
-                      setSelectedAlbumId(currentTrack.albumId);
+                    const targetAlbId = currentTrack?.albumId || buildAlbumIdentityKey(currentTrack?.album, currentTrack?.albumArtist, currentTrack?.folderPath);
+                    if (targetAlbId) {
+                      setSelectedAlbumId(targetAlbId);
                       setActiveTab('library');
                       setLibraryViewMode('albums');
                     }
@@ -5676,8 +5798,8 @@ export default function App() {
             {/* Integrated Multi-Line Wrapping Synchronized Lyrics Viewport (No Truncation, No Scrollbar) */}
             <div className="relative z-10 min-h-[104px] max-h-[124px] flex flex-col justify-center px-2 shrink-0 overflow-hidden no-scrollbar">
               {autoLyricsState.status === 'loading' ? (
-                <div className="flex items-center justify-center gap-2 text-xs text-zinc-300/80 drop-shadow">
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                <div className="flex items-center justify-center gap-2 text-xs text-zinc-600 dark:text-zinc-300/80">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500 dark:text-amber-400" />
                   <span>Syncing lyrics...</span>
                 </div>
               ) : visibleLyricsWindow.length > 0 ? (
@@ -5694,12 +5816,12 @@ export default function App() {
                             handleSeek(Math.max(0, line.timeSec + offsetSec));
                           }
                         }}
-                        className={`max-w-md w-full px-2 whitespace-normal break-words [overflow-wrap:anywhere] [text-wrap:balance] leading-snug transition-[opacity,color,transform] duration-300 ease-out drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)] ${line.timeSec !== null ? 'cursor-pointer' : ''
+                        className={`max-w-md w-full px-2 whitespace-normal break-words [overflow-wrap:anywhere] [text-wrap:balance] leading-snug transition-[opacity,color,transform] duration-300 ease-out dark:drop-shadow-[0_2px_8px_rgba(0,0,0,0.95)] ${line.timeSec !== null ? 'cursor-pointer' : ''
                           } ${isActive
-                            ? 'text-amber-300 font-semibold text-xs sm:text-sm opacity-100'
+                            ? 'text-amber-600 dark:text-amber-300 font-semibold text-xs sm:text-sm opacity-100'
                             : isPast
-                              ? 'text-zinc-400 opacity-40 text-[11px] sm:text-xs'
-                              : 'text-zinc-200 opacity-70 text-[11px] sm:text-xs hover:opacity-95'
+                              ? 'text-zinc-400 dark:text-zinc-400 opacity-50 dark:opacity-40 text-[11px] sm:text-xs'
+                              : 'text-zinc-700 dark:text-zinc-200 opacity-90 dark:opacity-70 text-[11px] sm:text-xs hover:opacity-100'
                           }`}
                       >
                         {line.text}
@@ -5709,7 +5831,7 @@ export default function App() {
                 </div>
               ) : (
                 <div className="flex items-center justify-center">
-                  <span className="text-xs text-zinc-400/60 font-medium tracking-wide drop-shadow">
+                  <span className="text-xs text-zinc-400 dark:text-zinc-400/60 font-medium tracking-wide">
                     {autoLyricsState.status === 'offline' ? 'Offline' : '♪'}
                   </span>
                 </div>
@@ -5727,7 +5849,7 @@ export default function App() {
               />
 
               {/* Seek / Progress Bar */}
-              <div className="flex items-center gap-2.5 pt-1 border-t border-white/10">
+              <div className="flex items-center gap-2.5 pt-1 border-t border-zinc-200/80 dark:border-white/10">
                 <WithClock step={1}>
                   {(currentTime) => (
                     <span className="text-[11px] font-mono w-9 text-right shrink-0" style={{ color: activePalette?.hex300 || '#fcd34d' }}>
@@ -5736,21 +5858,28 @@ export default function App() {
                   )}
                 </WithClock>
                 <WithClock>
-                  {(currentTime) => (
-                    <input
-                      type="range"
-                      min={0}
-                      max={Math.max(1, duration || currentTrack?.duration || 1)}
-                      step={0.05}
-                      value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
-                      onChange={(e) => handleSeek(parseFloat(e.target.value))}
-                      aria-label="Seek timeline"
-                      style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
-                      className="flex-1 h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer"
-                    />
-                  )}
+                  {(currentTime) => {
+                    const dur = Math.max(1, duration || currentTrack?.duration || 1);
+                    const pct = Math.min(100, Math.max(0, (currentTime / dur) * 100));
+                    return (
+                      <input
+                        type="range"
+                        min={0}
+                        max={dur}
+                        step={0.05}
+                        value={Math.min(currentTime, dur)}
+                        onChange={(e) => handleSeek(parseFloat(e.target.value))}
+                        aria-label="Seek timeline"
+                        style={{
+                          accentColor: activePalette?.hex400 || '#fbbf24',
+                          '--range-progress': `${pct}%`
+                        }}
+                        className="aurelia-slider-progress flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
+                      />
+                    );
+                  }}
                 </WithClock>
-                <span className="text-[11px] font-mono text-zinc-400 w-9 shrink-0">
+                <span className="text-[11px] font-mono text-zinc-500 dark:text-zinc-400 w-9 shrink-0">
                   {formatTime(duration || currentTrack?.duration || 0)}
                 </span>
               </div>
@@ -5837,19 +5966,23 @@ export default function App() {
                       setVolume(parseFloat(e.target.value));
                     }}
                     aria-label="Volume"
-                    className="w-16 sm:w-20 h-1 bg-white/15 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                    style={{
+                      accentColor: activePalette?.hex400 || '#fbbf24',
+                      '--range-progress': `${(isMuted ? 0 : volume) * 100}%`
+                    }}
+                    className="aurelia-slider-progress w-16 sm:w-20 h-1.5 rounded-full appearance-none cursor-pointer"
                   />
                 </div>
               </div>
 
               {/* Minimal EQ Strip */}
-              <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-white/[0.07]">
+              <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-slate-200/80 dark:border-white/[0.07]">
                 <button
                   onClick={() => setActiveTab('equalizer')}
-                  className="text-[10px] text-zinc-400 hover:text-amber-300 flex items-center gap-1 transition"
+                  className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:text-amber-600 dark:hover:text-amber-300 flex items-center gap-1 transition"
                   title="Open 10-Band Parametric Equalizer"
                 >
-                  <SlidersHorizontal className="w-3 h-3 text-amber-400/80" />
+                  <SlidersHorizontal className="w-3 h-3 text-amber-500 dark:text-amber-400/80" />
                   <span>EQ 10-Band</span>
                 </button>
                 <div className="flex items-center gap-1">
@@ -5881,8 +6014,8 @@ export default function App() {
                         }
                       }}
                       className={`px-2 py-0.5 rounded-lg text-[10px] font-medium transition ${settings.eqPreset === eq.id
-                        ? 'bg-amber-500/25 text-amber-300 border border-amber-400/30'
-                        : 'text-zinc-400 hover:text-white hover:bg-white/5'
+                        ? 'bg-amber-500/20 text-amber-600 dark:text-amber-300 border border-amber-500/30'
+                        : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5'
                         }`}
                     >
                       {eq.label}
@@ -5899,14 +6032,14 @@ export default function App() {
           {activeTab === 'library' && (
             <div className="aurelia-glass-panel flex-1 min-h-0 rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-4 sm:p-5 shadow-2xl flex flex-col gap-3 overflow-hidden">
               {/* Folder & Library Management Bar */}
-              <div className="px-3 py-2 rounded-2xl bg-zinc-950/70 border border-white/[0.07] flex flex-col gap-2 shrink-0">
+              <div className="px-3 py-2 rounded-2xl bg-slate-100/90 dark:bg-zinc-950/70 border border-slate-200/90 dark:border-white/[0.07] flex flex-col gap-2 shrink-0">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    <FolderOpen className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    <span className="text-xs font-medium text-zinc-200 truncate">
+                    <FolderOpen className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0" />
+                    <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-200 truncate">
                       {rememberedFolder.name || t('library')}
                     </span>
-                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-zinc-400">
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-200/80 dark:bg-white/5 text-zinc-700 dark:text-zinc-400 border border-slate-300/60 dark:border-transparent">
                       {groupedAlbums.length} albums • {tracks.length} tracks
                     </span>
                   </div>
@@ -5922,32 +6055,32 @@ export default function App() {
                     </button>
                     <button
                       onClick={handleRescanFolder}
-                      className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-200 text-xs flex items-center gap-1.5 transition"
+                      className="px-2.5 py-1 rounded-lg bg-slate-200/80 hover:bg-slate-300/80 dark:bg-white/5 dark:hover:bg-white/10 border border-slate-300/80 dark:border-white/10 text-zinc-800 dark:text-zinc-200 text-xs flex items-center gap-1.5 transition"
                       title={t('rescanFolder')}
                     >
-                      <RefreshCw className="w-3 h-3 text-amber-400" />
+                      <RefreshCw className="w-3 h-3 text-amber-600 dark:text-amber-400" />
                       <span>{t('rescan')}</span>
                     </button>
                     <button
                       onClick={handleFindAndRemoveDuplicates}
-                      className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-1.5 transition"
+                      className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-700 dark:text-amber-300 text-xs flex items-center gap-1.5 transition font-medium"
                       title={t('removeDuplicates')}
                     >
-                      <Sparkles className="w-3 h-3 text-amber-400" />
+                      <Sparkles className="w-3 h-3 text-amber-600 dark:text-amber-400" />
                       <span>{t('cleanDuplicates')}</span>
                     </button>
                     <button
                       onClick={handleRunSmartMetadataAudit}
-                      className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 text-xs flex items-center gap-1.5 transition"
+                      className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-700 dark:text-sky-300 text-xs flex items-center gap-1.5 transition font-medium"
                       title={t('auditMetadata')}
                     >
-                      <Shield className="w-3 h-3 text-sky-400" />
+                      <Shield className="w-3 h-3 text-sky-600 dark:text-sky-400" />
                       <span>{t('smartScan')}</span>
                     </button>
                     {rememberedFolder.name && (
                       <button
                         onClick={handleForgetRememberedFolder}
-                        className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-rose-400/80 hover:text-rose-300"
+                        className="px-2 py-1 rounded-lg bg-slate-200/80 hover:bg-rose-100 dark:bg-white/5 dark:hover:bg-white/10 text-xs text-rose-600 dark:text-rose-400/80 hover:text-rose-700 dark:hover:text-rose-300 border border-slate-300/80 dark:border-transparent transition"
                         title={t('forget')}
                       >
                         <Trash2 className="w-3 h-3" />
@@ -5989,12 +6122,12 @@ export default function App() {
               {/* Library Controls Header */}
               <div className="flex flex-wrap items-center justify-between gap-2.5 shrink-0">
                 <div className="flex items-center gap-2">
-                  <div className="flex items-center gap-1 bg-zinc-950/80 p-1 rounded-xl border border-white/[0.07]">
+                  <div className="flex items-center gap-1 bg-slate-100 dark:bg-zinc-950/80 p-1 rounded-xl border border-slate-200 dark:border-white/[0.07]">
                     <button
                       onClick={() => setLibraryViewMode('albums')}
                       className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition ${libraryViewMode === 'albums'
-                        ? 'bg-amber-500 text-zinc-950 font-semibold'
-                        : 'text-zinc-400 hover:text-white'
+                        ? 'bg-amber-500 text-zinc-950 font-semibold shadow-sm'
+                        : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white'
                         }`}
                     >
                       <LayoutGrid className="w-3.5 h-3.5" />
@@ -6003,8 +6136,8 @@ export default function App() {
                     <button
                       onClick={() => setLibraryViewMode('tracks')}
                       className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition ${libraryViewMode === 'tracks'
-                        ? 'bg-amber-500 text-zinc-950 font-semibold'
-                        : 'text-zinc-400 hover:text-white'
+                        ? 'bg-amber-500 text-zinc-950 font-semibold shadow-sm'
+                        : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white'
                         }`}
                     >
                       <List className="w-3.5 h-3.5" />
@@ -6015,7 +6148,7 @@ export default function App() {
 
                 <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                   <div className="relative flex-1 sm:w-52">
-                    <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <Search className="w-3.5 h-3.5 text-zinc-400 dark:text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2" />
                     <input
                       type="text"
                       value={searchQuery}
@@ -6025,34 +6158,34 @@ export default function App() {
                         setVisibleTrackLimit(80);
                       }}
                       placeholder="Search library..."
-                      className="w-full pl-8 pr-7 py-1.5 rounded-xl bg-zinc-950/80 border border-white/[0.07] text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-amber-400/50"
+                      className="w-full pl-8 pr-7 py-1.5 rounded-xl bg-slate-50 dark:bg-zinc-950/80 border border-slate-200 dark:border-white/[0.07] text-xs text-zinc-900 dark:text-white placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:border-amber-500"
                     />
                     {searchQuery && (
                       <button
                         onClick={() => setSearchQuery('')}
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white"
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-700 dark:text-zinc-500 dark:hover:text-white"
                       >
                         <X className="w-3.5 h-3.5" />
                       </button>
                     )}
                   </div>
 
-                  <div className="flex items-center gap-1 bg-zinc-950/80 border border-white/[0.07] rounded-xl px-2 py-1">
+                  <div className="flex items-center gap-1 bg-slate-50 dark:bg-zinc-950/80 border border-slate-200 dark:border-white/[0.07] rounded-xl px-2 py-1">
                     <select
                       value={sortBy}
                       onChange={(e) => setSortBy(e.target.value)}
-                      className="bg-transparent text-xs text-zinc-300 focus:outline-none"
+                      className="bg-transparent text-xs text-zinc-800 dark:text-zinc-300 focus:outline-none cursor-pointer"
                       aria-label="Sort by"
                     >
-                      <option value="album" className="bg-zinc-900">Album</option>
-                      <option value="artist" className="bg-zinc-900">Artist</option>
-                      <option value="title" className="bg-zinc-900">Title</option>
-                      <option value="duration" className="bg-zinc-900">Duration</option>
-                      <option value="codec" className="bg-zinc-900">Codec</option>
+                      <option value="album" className="bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">Album</option>
+                      <option value="artist" className="bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">Artist</option>
+                      <option value="title" className="bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">Title</option>
+                      <option value="duration" className="bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">Duration</option>
+                      <option value="codec" className="bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">Codec</option>
                     </select>
                     <button
                       onClick={() => setSortAsc((s) => !s)}
-                      className="p-1 hover:bg-white/10 rounded text-amber-400"
+                      className="p-1 hover:bg-slate-200/80 dark:hover:bg-white/10 rounded text-amber-500 dark:text-amber-400"
                       title="Reverse sort order"
                     >
                       <ArrowUpDown className="w-3.5 h-3.5" />
@@ -6067,8 +6200,8 @@ export default function App() {
                   <button
                     onClick={() => setSelectedPlaylistId('ALL')}
                     className={`px-2.5 py-1 rounded-lg text-xs font-medium transition whitespace-nowrap ${selectedPlaylistId === 'ALL'
-                      ? 'bg-white/15 text-white'
-                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
+                      ? 'bg-zinc-900 text-white dark:bg-white/15 dark:text-white shadow-sm font-semibold'
+                      : 'text-zinc-600 hover:text-zinc-900 hover:bg-slate-100 dark:text-zinc-400 dark:hover:text-zinc-200 dark:hover:bg-white/5'
                       }`}
                   >
                     All
@@ -6078,8 +6211,8 @@ export default function App() {
                       key={pl.id}
                       onClick={() => setSelectedPlaylistId(pl.id)}
                       className={`px-2.5 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1.5 whitespace-nowrap ${selectedPlaylistId === pl.id
-                        ? 'bg-white/15 text-amber-300'
-                        : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
+                        ? 'bg-zinc-900 text-amber-400 dark:bg-white/15 dark:text-amber-300 shadow-sm font-semibold'
+                        : 'text-zinc-600 hover:text-zinc-900 hover:bg-slate-100 dark:text-zinc-400 dark:hover:text-zinc-200 dark:hover:bg-white/5'
                         }`}
                     >
                       <span>{pl.name}</span>
@@ -6095,11 +6228,11 @@ export default function App() {
                     onChange={(e) => setNewPlaylistName(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleCreatePlaylist()}
                     placeholder="New playlist"
-                    className="px-2.5 py-1 rounded-lg bg-zinc-950/60 border border-white/[0.07] text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-amber-400/50 w-28"
+                    className="px-2.5 py-1 rounded-lg bg-slate-50 dark:bg-zinc-950/60 border border-slate-200 dark:border-white/[0.07] text-xs text-zinc-900 dark:text-white placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:border-amber-500 w-28"
                   />
                   <button
                     onClick={handleCreatePlaylist}
-                    className="p-1 rounded-lg bg-white/5 hover:bg-amber-500 hover:text-zinc-950 text-zinc-300 transition"
+                    className="p-1 rounded-lg bg-slate-100 hover:bg-amber-500 hover:text-zinc-950 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 border border-slate-200 dark:border-transparent transition"
                     title="Create Playlist"
                   >
                     <Plus className="w-3.5 h-3.5" />
@@ -6156,8 +6289,8 @@ export default function App() {
                               key={album.id}
                               onClick={() => setSelectedAlbumId(album.id)}
                               className={`group rounded-2xl p-2 border transition-all cursor-pointer flex flex-col justify-between ${isSelected
-                                ? 'bg-white/[0.08] border-amber-500/45 shadow-md'
-                                : 'bg-zinc-950/45 hover:bg-white/[0.04] border-white/[0.06]'
+                                ? 'bg-amber-500/10 dark:bg-white/[0.08] border-amber-500/50 shadow-md'
+                                : 'bg-slate-50 dark:bg-zinc-950/45 hover:bg-slate-100 dark:hover:bg-white/[0.04] border-slate-200 dark:border-white/[0.06]'
                                 }`}
                             >
                               <div>
@@ -6197,7 +6330,7 @@ export default function App() {
                                 </div>
 
                                 <h3
-                                  className={`text-xs font-semibold truncate album-title-text ${isSelected ? 'text-amber-500 dark:text-amber-300' : 'text-zinc-900 dark:text-zinc-100'
+                                  className={`text-xs font-semibold truncate album-title-text ${isSelected ? 'text-amber-600 dark:text-amber-300' : 'text-zinc-900 dark:text-zinc-100'
                                     }`}
                                   title={album.title}
                                 >
@@ -6208,7 +6341,7 @@ export default function App() {
                                 </p>
                               </div>
 
-                              <div className="flex items-center justify-between text-[10px] font-mono text-zinc-500 mt-1.5">
+                              <div className="flex items-center justify-between text-[10px] font-mono text-zinc-500 dark:text-zinc-400 mt-1.5">
                                 <span>{album.tracks.length} trk</span>
                                 <span>{formatTime(album.totalDuration)}</span>
                               </div>
@@ -6219,10 +6352,10 @@ export default function App() {
                     </div>
 
                     {/* Selected Album Tracklist */}
-                    <div className="xl:col-span-5 min-h-0 rounded-2xl bg-zinc-950/60 border border-white/[0.07] p-3 flex flex-col overflow-hidden">
+                    <div className="xl:col-span-5 min-h-0 rounded-2xl bg-slate-50 dark:bg-zinc-950/60 border border-slate-200 dark:border-white/[0.07] p-3 flex flex-col overflow-hidden">
                       {activeSelectedAlbum ? (
                         <>
-                          <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-white/[0.07] shrink-0">
+                          <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-slate-200 dark:border-white/[0.07] shrink-0">
                             <div className="min-w-0 flex-1">
                               <h3
                                 className="text-sm font-semibold text-zinc-900 dark:text-white truncate album-title-text"
@@ -6247,14 +6380,14 @@ export default function App() {
                               </button>
                               <button
                                 onClick={() => handleQueueAlbum(activeSelectedAlbum)}
-                                className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-300 text-xs font-medium"
+                                className="px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-white/5 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 text-xs font-medium"
                                 title="Queue Album"
                               >
                                 +Queue
                               </button>
                               <button
                                 onClick={() => handleDeleteAlbum(activeSelectedAlbum)}
-                                className="p-2 rounded-xl bg-white/5 hover:bg-rose-500/20 border border-white/10 text-zinc-400 hover:text-rose-400 transition"
+                                className="p-2 rounded-xl bg-slate-100 hover:bg-rose-500/15 dark:bg-white/5 dark:hover:bg-rose-500/20 border border-slate-200 dark:border-white/10 text-zinc-500 hover:text-rose-600 dark:text-zinc-400 dark:hover:text-rose-400 transition"
                                 title={t('deleteAlbum')}
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
@@ -6262,7 +6395,7 @@ export default function App() {
                             </div>
                           </div>
 
-                          <div className="flex-1 min-h-0 overflow-y-auto aurelia-scrollbar divide-y divide-white/[0.04] pr-1 mt-1">
+                          <div className="flex-1 min-h-0 overflow-y-auto aurelia-scrollbar divide-y divide-slate-200/60 dark:divide-white/[0.04] pr-1 mt-1">
                             {activeSelectedAlbum.tracks.map((track, idx) => {
                               const isCurrent = track.id === currentTrackId;
                               const isFav = playlists
@@ -6273,8 +6406,8 @@ export default function App() {
                                   key={track.id}
                                   onClick={() => handlePlayAlbum(activeSelectedAlbum, track.id)}
                                   className={`group flex items-center justify-between gap-2 py-2 px-2 rounded-xl transition cursor-pointer ${isCurrent
-                                    ? 'bg-amber-500/15 text-amber-300'
-                                    : 'hover:bg-white/[0.04] text-zinc-200'
+                                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                                    : 'hover:bg-slate-100 dark:hover:bg-white/[0.04] text-zinc-800 dark:text-zinc-200'
                                     }`}
                                 >
                                   <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -6284,7 +6417,7 @@ export default function App() {
                                         : String(idx + 1).padStart(2, '0')}
                                     </span>
                                     <span
-                                      className={`text-xs truncate ${isCurrent ? 'text-amber-300 font-semibold' : 'text-zinc-100'
+                                      className={`text-xs truncate ${isCurrent ? 'text-amber-600 dark:text-amber-300 font-semibold' : 'text-zinc-900 dark:text-zinc-100'
                                         }`}
                                       title={track.title}
                                     >
@@ -6301,30 +6434,30 @@ export default function App() {
                                     className="flex items-center gap-1.5 shrink-0"
                                     onClick={(e) => e.stopPropagation()}
                                   >
-                                    <span className="text-[11px] font-mono text-zinc-500">
+                                    <span className="text-[11px] font-mono text-zinc-500 dark:text-zinc-400">
                                       {formatTime(track.duration)}
                                     </span>
                                     <button
                                       onClick={() => handleToggleTrackInPlaylist('pl-favorites', track.id)}
-                                      className={`p-1 rounded-lg transition ${isFav ? 'text-rose-400' : 'text-zinc-500 opacity-0 group-hover:opacity-100 hover:text-white'
+                                      className={`p-1 rounded-lg transition ${isFav ? 'text-rose-500' : 'text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-zinc-800 dark:hover:text-white'
                                         }`}
                                       title="Favorite"
                                     >
-                                      <Heart className={`w-3 h-3 ${isFav ? 'fill-rose-400' : ''}`} />
+                                      <Heart className={`w-3 h-3 ${isFav ? 'fill-rose-500' : ''}`} />
                                     </button>
                                     <button
                                       onClick={() => handleAddToQueue(track.id, true)}
-                                      className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] font-mono text-zinc-400 opacity-0 group-hover:opacity-100 transition"
+                                      className="px-1.5 py-0.5 rounded bg-slate-100 hover:bg-slate-200 dark:bg-white/5 dark:hover:bg-white/10 border border-slate-200 dark:border-transparent text-[10px] font-mono text-zinc-600 dark:text-zinc-400 opacity-0 group-hover:opacity-100 transition"
                                       title="Play Next"
                                     >
                                       +Q
                                     </button>
                                     <button
                                       onClick={() => handleDeleteTrack(track.id)}
-                                      className="p-1 rounded-lg text-zinc-500 opacity-0 group-hover:opacity-100 hover:text-rose-400 transition"
+                                      className="p-1 rounded-lg text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-rose-500 transition"
                                       title={t('deleteTrack')}
                                     >
-                                      <Trash2 className="w-3 h-3" />
+                                      <Trash2 className="w-3.5 h-3.5" />
                                     </button>
                                   </div>
                                 </div>
@@ -6360,13 +6493,14 @@ export default function App() {
                         <div
                           key={track.id}
                           onClick={() => {
-                            setSelectedAlbumId(track.albumId);
+                            const albId = track.albumId || buildAlbumIdentityKey(track.album, track.albumArtist, track.folderPath);
+                            setSelectedAlbumId(albId);
                             if (!isCurrent) startTrackById(track.id);
                             else togglePlayPause();
                           }}
                           className={`group flex items-center justify-between gap-3 p-2 rounded-xl transition cursor-pointer shrink-0 ${isCurrent
-                            ? 'bg-amber-500/15 text-amber-300'
-                            : 'hover:bg-white/[0.04]'
+                            ? 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
+                            : 'hover:bg-slate-100 dark:hover:bg-white/[0.04]'
                             }`}
                         >
                           <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -6379,7 +6513,7 @@ export default function App() {
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-2">
                                 <span
-                                  className={`text-xs font-medium truncate ${isCurrent ? 'text-amber-500 dark:text-amber-300 font-semibold' : 'text-zinc-900 dark:text-zinc-100'
+                                  className={`text-xs font-medium truncate ${isCurrent ? 'text-amber-600 dark:text-amber-300 font-semibold' : 'text-zinc-900 dark:text-zinc-100'
                                     }`}
                                   title={track.title}
                                 >
@@ -6398,30 +6532,30 @@ export default function App() {
                           </div>
 
                           <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
-                            <span className="hidden sm:inline text-[10px] font-mono text-zinc-500">
+                            <span className="hidden sm:inline text-[10px] font-mono text-zinc-500 dark:text-zinc-400">
                               {track.codec.split(' ')[0]}
                             </span>
-                            <span className="text-xs font-mono text-zinc-400 w-10 text-right">
+                            <span className="text-xs font-mono text-zinc-500 dark:text-zinc-400 w-10 text-right">
                               {formatTime(track.duration)}
                             </span>
                             <button
                               onClick={() => handleToggleTrackInPlaylist('pl-favorites', track.id)}
-                              className={`p-1.5 rounded-lg transition ${isFav ? 'text-rose-400' : 'text-zinc-500 hover:text-white'
+                              className={`p-1.5 rounded-lg transition ${isFav ? 'text-rose-500' : 'text-zinc-400 hover:text-zinc-800 dark:hover:text-white'
                                 }`}
                               title="Favorite"
                             >
-                              <Heart className={`w-3.5 h-3.5 ${isFav ? 'fill-rose-400' : ''}`} />
+                              <Heart className={`w-3.5 h-3.5 ${isFav ? 'fill-rose-500' : ''}`} />
                             </button>
                             <button
                               onClick={() => handleAddToQueue(track.id, true)}
-                              className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-[10px] font-mono text-zinc-300"
+                              className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-white/5 dark:hover:bg-white/10 border border-slate-200 dark:border-white/5 text-[10px] font-mono text-zinc-700 dark:text-zinc-300 transition"
                               title="Queue Next"
                             >
                               +Q
                             </button>
                             <button
                               onClick={() => handleDeleteTrack(track.id)}
-                              className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 transition"
+                              className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-500 transition"
                               title={t('deleteTrack')}
                             >
                               <Trash2 className="w-3.5 h-3.5" />
@@ -7503,18 +7637,25 @@ export default function App() {
                 )}
               </WithClock>
               <WithClock>
-                {(currentTime) => (
-                  <input
-                    type="range"
-                    min={0}
-                    max={Math.max(1, duration || currentTrack?.duration || 1)}
-                    step={0.05}
-                    value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
-                    onChange={(e) => handleSeek(parseFloat(e.target.value))}
-                    style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
-                    className="flex-1 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer"
-                  />
-                )}
+                {(currentTime) => {
+                  const dur = Math.max(1, duration || currentTrack?.duration || 1);
+                  const pct = Math.min(100, Math.max(0, (currentTime / dur) * 100));
+                  return (
+                    <input
+                      type="range"
+                      min={0}
+                      max={dur}
+                      step={0.05}
+                      value={Math.min(currentTime, dur)}
+                      onChange={(e) => handleSeek(parseFloat(e.target.value))}
+                      style={{
+                        accentColor: activePalette?.hex400 || '#fbbf24',
+                        '--range-progress': `${pct}%`
+                      }}
+                      className="aurelia-slider-progress flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
+                    />
+                  );
+                }}
               </WithClock>
               <span className="text-xs font-mono text-zinc-400 w-10">
                 {formatTime(duration || currentTrack?.duration || 0)}
@@ -7570,7 +7711,11 @@ export default function App() {
                     setIsMuted(false);
                     setVolume(parseFloat(e.target.value));
                   }}
-                  className="w-24 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                  style={{
+                    accentColor: activePalette?.hex400 || '#fbbf24',
+                    '--range-progress': `${(isMuted ? 0 : volume) * 100}%`
+                  }}
+                  className="aurelia-slider-progress w-24 h-1.5 rounded-full appearance-none cursor-pointer"
                 />
               </div>
             </div>

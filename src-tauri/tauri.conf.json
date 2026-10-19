@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Aurelia Audio",
-  "version": "0.2.1",
+  "version": "0.2.6",
   "identifier": "com.aurelia.audio",
   "build": {
     "frontendDist": "../dist",
@@ -26,6 +26,10 @@
     ],
     "security": {
       "csp": null,
+      "headers": {
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS"
+      },
       "assetProtocol": {
         "enable": true,
         "scope": [

@@ -57,8 +57,10 @@ function PeqPanel({
         const height = canvas.height;
         ctx.clearRect(0, 0, width, height);
 
-        const accentColor =
-            getComputedStyle(document.documentElement).getPropertyValue('--accent-hex-400').trim() || '#fbbf24';
+        const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+        const accentColor = isLight
+            ? (getComputedStyle(document.documentElement).getPropertyValue('--accent-hex-600').trim() || '#d97706')
+            : (getComputedStyle(document.documentElement).getPropertyValue('--accent-hex-400').trim() || '#fbbf24');
 
         const dbToY = (db) => {
             const clamped = Math.max(-15, Math.min(15, db));
@@ -74,13 +76,15 @@ function PeqPanel({
         ctx.lineWidth = 1;
         [-12, -6, 0, 6, 12].forEach((db) => {
             const y = dbToY(db);
-            ctx.strokeStyle = db === 0 ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.06)';
+            ctx.strokeStyle = db === 0
+                ? (isLight ? 'rgba(15, 23, 42, 0.28)' : 'rgba(255, 255, 255, 0.22)')
+                : (isLight ? 'rgba(15, 23, 42, 0.08)' : 'rgba(255, 255, 255, 0.06)');
             ctx.beginPath();
             ctx.moveTo(0, y);
             ctx.lineTo(width, y);
             ctx.stroke();
 
-            ctx.fillStyle = 'rgba(161,161,170,0.65)';
+            ctx.fillStyle = isLight ? 'rgba(51, 65, 85, 0.85)' : 'rgba(161, 161, 170, 0.65)';
             ctx.font = '10px monospace';
             ctx.fillText(`${db > 0 ? `+${db}` : db}dB`, 6, y - 3);
         });
@@ -88,13 +92,13 @@ function PeqPanel({
         // Frequency markers
         [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000].forEach((f) => {
             const x = freqToX(f);
-            ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+            ctx.strokeStyle = isLight ? 'rgba(15, 23, 42, 0.08)' : 'rgba(255, 255, 255, 0.05)';
             ctx.beginPath();
             ctx.moveTo(x, 0);
             ctx.lineTo(x, height);
             ctx.stroke();
 
-            ctx.fillStyle = 'rgba(161,161,170,0.65)';
+            ctx.fillStyle = isLight ? 'rgba(51, 65, 85, 0.85)' : 'rgba(161, 161, 170, 0.65)';
             ctx.font = '10px monospace';
             const label = f >= 1000 ? `${f / 1000}k` : `${f}`;
             ctx.fillText(label, Math.max(4, Math.min(width - 24, x - 10)), height - 4);
@@ -110,7 +114,7 @@ function PeqPanel({
             if (i === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
         }
-        ctx.strokeStyle = peqState.enabled ? accentColor : 'rgba(161,161,170,0.4)';
+        ctx.strokeStyle = peqState.enabled ? accentColor : (isLight ? 'rgba(100, 116, 139, 0.6)' : 'rgba(161,161,170,0.4)');
         ctx.lineWidth = 2.5;
         ctx.stroke();
 
@@ -118,7 +122,7 @@ function PeqPanel({
         ctx.lineTo(width, dbToY(0));
         ctx.lineTo(0, dbToY(0));
         ctx.closePath();
-        ctx.fillStyle = peqState.enabled ? `${accentColor}22` : 'rgba(161,161,170,0.06)';
+        ctx.fillStyle = peqState.enabled ? `${accentColor}25` : (isLight ? 'rgba(15, 23, 42, 0.04)' : 'rgba(161,161,170,0.06)');
         ctx.fill();
 
         // Draw nodes for each of the 10 bands
@@ -127,9 +131,9 @@ function PeqPanel({
             const y = dbToY(peqState.enabled && b.enabled ? b.gain + peqState.preamp : 0);
             ctx.beginPath();
             ctx.arc(x, y, 4.5, 0, Math.PI * 2);
-            ctx.fillStyle = peqState.enabled && b.enabled ? accentColor : '#52525b';
+            ctx.fillStyle = peqState.enabled && b.enabled ? accentColor : (isLight ? '#94a3b8' : '#52525b');
             ctx.fill();
-            ctx.strokeStyle = '#09090b';
+            ctx.strokeStyle = isLight ? '#ffffff' : '#09090b';
             ctx.lineWidth = 1.5;
             ctx.stroke();
         });
@@ -446,9 +450,9 @@ function PeqPanel({
                 <div className="flex items-center gap-1.5 mt-0.5">
                     <button
                         type="button"
-                        onClick={(e) => handleGainStep(idx, e.shiftKey ? -0.1 : -0.5)}
+                        onClick={(e) => handleGainStep(idx, e.shiftKey ? -0.5 : -0.1)}
                         className="w-6 h-6 rounded-lg bg-white/5 hover:bg-white/15 border border-white/10 text-zinc-300 hover:text-white flex items-center justify-center transition active:scale-95 shrink-0"
-                        title="Decrease Gain (-0.5 dB, Shift+click for -0.1 dB)"
+                        title="Decrease Gain (-0.1 dB, Shift+click for -0.5 dB)"
                     >
                         <Minus className="w-3.5 h-3.5" />
                     </button>
@@ -462,16 +466,16 @@ function PeqPanel({
                             value={band.gain}
                             onDoubleClick={() => handleBandChange(idx, { gain: 0 })}
                             onChange={(e) => handleBandChange(idx, { gain: parseFloat(e.target.value) })}
-                            className="w-full h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                            className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-amber-400"
                             title="Gain (dB) — Double-click to reset to 0 dB"
                         />
                     </div>
 
                     <button
                         type="button"
-                        onClick={(e) => handleGainStep(idx, e.shiftKey ? +0.1 : +0.5)}
+                        onClick={(e) => handleGainStep(idx, e.shiftKey ? +0.5 : +0.1)}
                         className="w-6 h-6 rounded-lg bg-white/5 hover:bg-white/15 border border-white/10 text-zinc-300 hover:text-white flex items-center justify-center transition active:scale-95 shrink-0"
-                        title="Increase Gain (+0.5 dB, Shift+click for +0.1 dB)"
+                        title="Increase Gain (+0.1 dB, Shift+click for +0.5 dB)"
                     >
                         <Plus className="w-3.5 h-3.5" />
                     </button>
@@ -705,9 +709,9 @@ function PeqPanel({
                             <div className="flex items-center gap-2">
                                 <button
                                     type="button"
-                                    onClick={(e) => handlePreampStep(e.shiftKey ? -0.1 : -0.5)}
+                                    onClick={(e) => handlePreampStep(e.shiftKey ? -0.5 : -0.1)}
                                     className="w-7 h-7 rounded-lg bg-white/5 hover:bg-white/15 border border-white/10 flex items-center justify-center text-zinc-300 hover:text-white transition active:scale-95"
-                                    title="Decrease Preamp (-0.5 dB, Shift+click for -0.1 dB)"
+                                    title="Decrease Preamp (-0.1 dB, Shift+click for -0.5 dB)"
                                 >
                                     <Minus className="w-3.5 h-3.5" />
                                 </button>
@@ -716,9 +720,9 @@ function PeqPanel({
                                 </span>
                                 <button
                                     type="button"
-                                    onClick={(e) => handlePreampStep(e.shiftKey ? +0.1 : +0.5)}
+                                    onClick={(e) => handlePreampStep(e.shiftKey ? +0.5 : +0.1)}
                                     className="w-7 h-7 rounded-lg bg-white/5 hover:bg-white/15 border border-white/10 flex items-center justify-center text-zinc-300 hover:text-white transition active:scale-95"
-                                    title="Increase Preamp (+0.5 dB, Shift+click for +0.1 dB)"
+                                    title="Increase Preamp (+0.1 dB, Shift+click for +0.5 dB)"
                                 >
                                     <Plus className="w-3.5 h-3.5" />
                                 </button>
@@ -758,7 +762,7 @@ function PeqPanel({
                                     onChangeCustomPresets(nextCustom);
                                 }
                             }}
-                            className="w-full h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                            className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-amber-400"
                         />
                         <div className="flex justify-between text-[10px] font-mono text-zinc-500 mt-1">
                             <span>-12 dB</span>

@@ -1,6 +1,6 @@
 [package]
 name = "aurelia-audio"
-version = "0.2.1"
+version = "0.2.6"
 description = "Aurelia Audio — Audiophile Desktop Music Player"
 authors = ["you"]
 license = ""

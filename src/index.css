@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *, .dark, .dark *));
+
 @theme {
   --color-amber-200: var(--accent-hex-200, #fde68a);
   --color-amber-300: var(--accent-hex-300, #fcd34d);
@@ -52,58 +54,58 @@
    ========================================================================== */
 html[data-theme="light"],
 html[data-theme="light"] body {
-  background-color: #e2e8f0;
-  color: #090d16;
+  background-color: #eef2f6;
+  color: #0f172a;
 }
 
 /* Outer Application Canvas */
 html[data-theme="light"] .aurelia-app-root,
 html[data-theme="light"] .bg-\[\#07080c\] {
-  background-color: #e2e8f0 !important;
-  color: #090d16 !important;
+  background-color: #eef2f6 !important;
+  color: #0f172a !important;
 }
 
 /* Dynamic Backdrop Overlays in Light Mode */
 html[data-theme="light"] .aurelia-backdrop-overlay {
-  background: linear-gradient(to bottom, rgba(226, 232, 240, 0.72), rgba(226, 232, 240, 0.85), #e2e8f0) !important;
+  background: linear-gradient(to bottom, rgba(238, 242, 246, 0.82), rgba(238, 242, 246, 0.95), #eef2f6) !important;
 }
 
 html[data-theme="light"] .aurelia-centerpiece-overlay {
-  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.35), rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.94)) !important;
+  display: none !important;
 }
 
 html[data-theme="light"] .aurelia-centerpiece-radial {
-  background: radial-gradient(circle at 50% 26%, transparent 15%, rgba(255, 255, 255, 0.85) 100%) !important;
+  display: none !important;
 }
 
-/* Frosted Glass Panels in Light Mode */
+/* Floating Master Panels in Light Mode: Solid crisp white cards with clear borders & soft shadows */
 html[data-theme="light"] .aurelia-glass-panel,
 html[data-theme="light"] .bg-zinc-900\/55 {
-  background-color: rgba(255, 255, 255, 0.75) !important;
-  backdrop-filter: blur(34px) saturate(200%) !important;
-  -webkit-backdrop-filter: blur(34px) saturate(200%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.95) !important;
-  box-shadow: 0 20px 45px -12px rgba(15, 23, 42, 0.14), 0 0 0 1px rgba(15, 23, 42, 0.08), inset 0 1.5px 0.5px 0 rgba(255, 255, 255, 1) !important;
+  background-color: #ffffff !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: 1px solid rgba(15, 23, 42, 0.09) !important;
+  box-shadow: 0 10px 30px -5px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.04) !important;
 }
 
 html[data-theme="light"] .aurelia-player-centerpiece {
-  background-color: rgba(255, 255, 255, 0.78) !important;
-  backdrop-filter: blur(36px) saturate(200%) !important;
-  -webkit-backdrop-filter: blur(36px) saturate(200%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.95) !important;
-  box-shadow: 0 20px 45px -12px rgba(15, 23, 42, 0.15), 0 0 0 1px rgba(15, 23, 42, 0.08), inset 0 1.5px 0.5px 0 rgba(255, 255, 255, 1) !important;
+  background-color: #ffffff !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: 1px solid rgba(15, 23, 42, 0.09) !important;
+  box-shadow: 0 10px 30px -5px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.04) !important;
 }
 
 html[data-theme="light"] .aurelia-glass-header,
 html[data-theme="light"] header {
-  background-color: rgba(255, 255, 255, 0.82) !important;
-  backdrop-filter: blur(28px) saturate(180%) !important;
-  -webkit-backdrop-filter: blur(28px) saturate(180%) !important;
-  border-bottom: 1px solid rgba(15, 23, 42, 0.12) !important;
-  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05) !important;
+  background-color: #ffffff !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08) !important;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04) !important;
 }
 
-/* Inner Cards and Subsections in Light Mode - High Contrast & No Bleed */
+/* Inner Cards and Subsections in Light Mode - High Contrast & Depth Hierarchy */
 html[data-theme="light"] .bg-zinc-950,
 html[data-theme="light"] .bg-zinc-950\/95,
 html[data-theme="light"] .bg-zinc-950\/90,
@@ -111,29 +113,32 @@ html[data-theme="light"] .bg-zinc-950\/80,
 html[data-theme="light"] .bg-zinc-950\/75,
 html[data-theme="light"] .bg-zinc-950\/70,
 html[data-theme="light"] .bg-zinc-950\/65,
-html[data-theme="light"] .bg-zinc-950\/60 {
-  background-color: rgba(255, 255, 255, 0.96) !important;
-  border: 1px solid rgba(15, 23, 42, 0.13) !important;
-  box-shadow: 0 4px 16px -2px rgba(15, 23, 42, 0.07), inset 0 1px 0 rgba(255, 255, 255, 1) !important;
-}
-
+html[data-theme="light"] .bg-zinc-950\/60,
 html[data-theme="light"] .bg-zinc-950\/50,
 html[data-theme="light"] .bg-zinc-950\/45,
+html[data-theme="light"] .bg-zinc-950\/40,
+html[data-theme="light"] .bg-zinc-950\/35 {
+  background-color: #f8fafc !important;
+  border: 1px solid rgba(15, 23, 42, 0.07) !important;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03) !important;
+}
+
 html[data-theme="light"] .bg-zinc-900\/50,
 html[data-theme="light"] .bg-zinc-900\/55,
 html[data-theme="light"] .bg-zinc-900\/60,
 html[data-theme="light"] .bg-zinc-900\/70,
 html[data-theme="light"] .bg-zinc-900\/80,
 html[data-theme="light"] .bg-zinc-900\/90,
+html[data-theme="light"] .bg-zinc-900\/95,
 html[data-theme="light"] .bg-zinc-900 {
-  background-color: rgba(248, 250, 252, 0.92) !important;
-  border: 1px solid rgba(15, 23, 42, 0.12) !important;
-  box-shadow: 0 2px 8px -1px rgba(15, 23, 42, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.95) !important;
+  background-color: #f8fafc !important;
+  border: 1px solid rgba(15, 23, 42, 0.07) !important;
+  color: #0f172a !important;
 }
 
 html[data-theme="light"] .bg-zinc-950\/30 {
-  background-color: rgba(15, 23, 42, 0.05) !important;
-  border: 1px solid rgba(15, 23, 42, 0.08) !important;
+  background-color: #f1f5f9 !important;
+  border: 1px solid rgba(15, 23, 42, 0.07) !important;
 }
 
 /* Selected Album Card Highlight */
@@ -153,13 +158,13 @@ html[data-theme="light"] .border-white\/\[0\.05\],
 html[data-theme="light"] .border-white\/\[0\.06\],
 html[data-theme="light"] .border-white\/\[0\.07\],
 html[data-theme="light"] .border-white\/\[0\.08\] {
-  border-color: rgba(15, 23, 42, 0.12) !important;
+  border-color: rgba(15, 23, 42, 0.08) !important;
 }
 
 /* High-Contrast Crisp Typography in Light Mode */
 html[data-theme="light"] .text-white,
 html[data-theme="light"] .text-zinc-100 {
-  color: #090d16 !important;
+  color: #0f172a !important;
 }
 
 html[data-theme="light"] .text-zinc-200,
@@ -174,12 +179,12 @@ html[data-theme="light"] .text-zinc-300\/90 {
 html[data-theme="light"] .text-zinc-400,
 html[data-theme="light"] .text-zinc-400\/60,
 html[data-theme="light"] .text-zinc-400\/80 {
-  color: #334155 !important;
+  color: #475569 !important;
   font-weight: 500;
 }
 
 html[data-theme="light"] .text-zinc-500 {
-  color: #475569 !important;
+  color: #64748b !important;
   font-weight: 500;
 }
 
@@ -190,12 +195,12 @@ html[data-theme="light"] .text-zinc-600 {
 
 /* Album Titles & Subtitles in Light Mode */
 html[data-theme="light"] .album-title-text {
-  color: #090d16 !important;
+  color: #0f172a !important;
   font-weight: 600 !important;
 }
 
 html[data-theme="light"] .album-subtitle-text {
-  color: #334155 !important;
+  color: #475569 !important;
   font-weight: 500 !important;
 }
 
@@ -204,7 +209,6 @@ html[data-theme="light"] .drop-shadow,
 html[data-theme="light"] [class*="drop-shadow"] {
   filter: none !important;
 }
-
 
 /* Dynamic Accent & Amber Readability Enhancement in Light Mode */
 html[data-theme="light"] .text-amber-300,
@@ -222,7 +226,7 @@ html[data-theme="light"] .text-amber-300\/75 {
 
 html[data-theme="light"] .text-amber-300\/60 {
   color: var(--accent-hex-600, #d97706) !important;
-  opacity: 0.9 !important;
+  opacity: 0.95 !important;
   font-weight: 600;
 }
 
@@ -247,55 +251,59 @@ html[data-theme="light"] .bg-white\/\[0\.04\],
 html[data-theme="light"] .bg-white\/\[0\.05\],
 html[data-theme="light"] .bg-white\/\[0\.06\],
 html[data-theme="light"] .bg-white\/\[0\.07\] {
-  background-color: rgba(15, 23, 42, 0.06) !important;
-  border-color: rgba(15, 23, 42, 0.12) !important;
+  background-color: #f1f5f9 !important;
+  border-color: rgba(15, 23, 42, 0.08) !important;
   color: #1e293b !important;
 }
 
 html[data-theme="light"] .bg-white\/10,
 html[data-theme="light"] .bg-white\/15,
 html[data-theme="light"] .bg-white\/20 {
-  background-color: rgba(15, 23, 42, 0.08) !important;
-  border-color: rgba(15, 23, 42, 0.14) !important;
-  color: #090d16 !important;
+  background-color: #f1f5f9 !important;
+  border-color: rgba(15, 23, 42, 0.09) !important;
+  color: #0f172a !important;
 }
 
+/* Fix hover states in Light Mode: NEVER turn white on white! */
 html[data-theme="light"] .hover\:bg-white\/\[0\.04\]:hover,
 html[data-theme="light"] .hover\:bg-white\/\[0\.05\]:hover,
 html[data-theme="light"] .hover\:bg-white\/5:hover,
 html[data-theme="light"] .hover\:bg-white\/10:hover,
-html[data-theme="light"] .hover\:bg-white\/15:hover {
-  background-color: rgba(15, 23, 42, 0.08) !important;
-  color: #090d16 !important;
+html[data-theme="light"] .hover\:bg-white\/15:hover,
+html[data-theme="light"] [class*="hover:bg-white"]:hover {
+  background-color: #e2e8f0 !important;
+  color: #0f172a !important;
 }
 
 html[data-theme="light"] .hover\:text-white:hover,
-html[data-theme="light"] .hover\:text-zinc-200:hover {
-  color: #090d16 !important;
+html[data-theme="light"] .hover\:text-zinc-100:hover,
+html[data-theme="light"] .hover\:text-zinc-200:hover,
+html[data-theme="light"] [class*="hover:text-white"]:hover,
+html[data-theme="light"] [class*="hover:text-zinc-100"]:hover,
+html[data-theme="light"] [class*="hover:text-zinc-200"]:hover {
+  color: #0f172a !important;
 }
 
-/* Titlebar, Capsule & Dark Utility Buttons in Light Mode */
-html[data-theme="light"] .bg-black\/30 {
-  background-color: rgba(255, 255, 255, 0.92) !important;
-  border-color: rgba(15, 23, 42, 0.14) !important;
-  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06), inset 0 1px 0 rgba(255, 255, 255, 1) !important;
-}
-
+/* Utility boxes & Canvas backings in Light Mode */
+html[data-theme="light"] .bg-black\/15,
+html[data-theme="light"] .bg-black\/20,
+html[data-theme="light"] .bg-black\/25,
+html[data-theme="light"] .bg-black\/30,
 html[data-theme="light"] .bg-black\/35,
 html[data-theme="light"] .bg-black\/40,
 html[data-theme="light"] .bg-black\/60 {
-  background-color: rgba(255, 255, 255, 0.88) !important;
-  border-color: rgba(15, 23, 42, 0.13) !important;
+  background-color: #f1f5f9 !important;
+  border-color: rgba(15, 23, 42, 0.08) !important;
   color: #1e293b !important;
-  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06) !important;
 }
 
 html[data-theme="light"] .bg-black\/35:hover,
 html[data-theme="light"] .bg-black\/60:hover,
 html[data-theme="light"] .hover\:bg-black\/60:hover,
-html[data-theme="light"] .hover\:bg-black:hover {
-  background-color: #ffffff !important;
-  color: #090d16 !important;
+html[data-theme="light"] .hover\:bg-black:hover,
+html[data-theme="light"] [class*="hover:bg-black"]:hover {
+  background-color: #e2e8f0 !important;
+  color: #0f172a !important;
 }
 
 html[data-theme="light"] .bg-black\/75,
@@ -304,23 +312,136 @@ html[data-theme="light"] .bg-black\/80 {
   backdrop-filter: blur(8px) !important;
 }
 
+/* ==========================================================================
+   Range Sliders System — Transparent Base with Crisp, Visible Tracks & Thumbs
+   ========================================================================== */
+
+/* 1. Base input element: transparent bounding box with no borders or boxes */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent !important;
+  background-color: transparent !important;
+  border: none !important;
+  outline: none;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+}
+
+/* 2. Standard Track (PEQ bands, Preamp, Settings, etc.) */
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.22) !important;
+  border: none !important;
+  transition: background-color 0.15s ease;
+}
+
+html[data-theme="light"] input[type="range"]::-webkit-slider-runnable-track {
+  background: #cbd5e1 !important; /* High-contrast, clean slate-300 track on white cards */
+}
+
+/* 3. Audio Seekbar & Volume Progress Slider: Active Filled Gradient */
+input[type="range"].aurelia-slider-progress::-webkit-slider-runnable-track {
+  background: linear-gradient(
+    to right,
+    var(--color-accent, #f59e0b) 0%,
+    var(--color-accent, #f59e0b) var(--range-progress, 0%),
+    rgba(255, 255, 255, 0.22) var(--range-progress, 0%),
+    rgba(255, 255, 255, 0.22) 100%
+  ) !important;
+}
+
+html[data-theme="light"] input[type="range"].aurelia-slider-progress::-webkit-slider-runnable-track {
+  background: linear-gradient(
+    to right,
+    var(--color-accent, #f59e0b) 0%,
+    var(--color-accent, #f59e0b) var(--range-progress, 0%),
+    #cbd5e1 var(--range-progress, 0%),
+    #cbd5e1 100%
+  ) !important;
+}
+
+/* 4. Thumb Styling (Crisp, High-precision circular control handle) */
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 14px;
+  width: 14px;
+  border-radius: 9999px;
+  background: var(--color-accent, #f59e0b) !important;
+  margin-top: -4px; /* (6px track - 14px thumb) / 2 = -4px to center thumb */
+  border: 2px solid #ffffff !important;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+input[type="range"]:hover::-webkit-slider-thumb {
+  transform: scale(1.18);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+input[type="range"]:active::-webkit-slider-thumb {
+  transform: scale(1.28);
+}
+
+/* 5. Firefox Support */
+input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.22);
+  border: none;
+}
+
+html[data-theme="light"] input[type="range"]::-moz-range-track {
+  background: #cbd5e1;
+}
+
+input[type="range"].aurelia-slider-progress::-moz-range-track {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+html[data-theme="light"] input[type="range"].aurelia-slider-progress::-moz-range-track {
+  background: #cbd5e1;
+}
+
+input[type="range"]::-moz-range-progress {
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--color-accent, #f59e0b);
+}
+
+input[type="range"]::-moz-range-thumb {
+  height: 14px;
+  width: 14px;
+  border-radius: 9999px;
+  background: var(--color-accent, #f59e0b);
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+}
+
 /* Input Fields and Selects in Light Mode */
 html[data-theme="light"] input[type="text"],
+html[data-theme="light"] input[type="number"],
 html[data-theme="light"] .bg-zinc-950\/80 input,
 html[data-theme="light"] select {
   background-color: #ffffff !important;
-  color: #090d16 !important;
-  border: 1px solid rgba(15, 23, 42, 0.16) !important;
+  color: #0f172a !important;
+  border: 1px solid rgba(203, 213, 225, 0.9) !important;
   box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04) !important;
 }
 
 html[data-theme="light"] select option,
 html[data-theme="light"] select optgroup {
   background-color: #ffffff !important;
-  color: #090d16 !important;
+  color: #0f172a !important;
 }
 
-html[data-theme="light"] input[type="text"]::placeholder {
+html[data-theme="light"] input[type="text"]::placeholder,
+html[data-theme="light"] input::placeholder {
   color: #64748b !important;
 }
 
