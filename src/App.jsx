@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, useSyncExternalStore } from 'react';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { ACCENT_PALETTES, applyAppearanceTokens, getPalette, extractDominantColor } from './theme';
 import { getTranslation } from './i18n';
 import {
@@ -11,7 +11,6 @@ import {
   applyPeqToAudioNodes
 } from './peqEngine';
 import PeqPanel from './components/PeqPanel';
-import MiniPlayerOverlay from './components/MiniPlayerOverlay';
 import {
   Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Volume1,
   Repeat, Repeat1, Shuffle, Music, Disc, FolderOpen, Upload,
@@ -20,7 +19,7 @@ import {
   RefreshCw, ListMusic, HardDrive,
   Shield, Zap, BarChart2, CheckCircle2,
   ArrowUpDown, SlidersHorizontal, Heart, LayoutGrid, List, ChevronUp, ChevronDown,
-  AlignCenter, Globe, ExternalLink, Pin, EyeOff, Sun, Moon, Palette, Check
+  AlignCenter, Globe, ExternalLink, EyeOff, Sun, Moon, Palette, Check
 } from 'lucide-react';
 
 const SUPPORTED_CODECS = [
@@ -1609,6 +1608,59 @@ async function resolveAutomaticOnlineLyrics(track, signal) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Playback clock
+// The playback position changes several times per second. Keeping it in App's React state re-rendered the
+// whole interface (including the entire library list) on every tick, which made playback laggy. It now lives
+// in this tiny external store, and only the small pieces of UI that really show the time subscribe to it.
+// ---------------------------------------------------------------------------
+const playbackClock = (() => {
+  let value = 0;
+  const listeners = new Set();
+  return {
+    get: () => value,
+    set: (next) => {
+      if (next === value) return;
+      value = next;
+      listeners.forEach((listener) => listener());
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    }
+  };
+})();
+
+// Re-renders the calling component only when select(time) returns a different value
+function useClock(select) {
+  return useSyncExternalStore(playbackClock.subscribe, () => select(playbackClock.get()));
+}
+
+// Render-prop wrapper: only this small component re-renders as time advances. step > 0 rounds the time down.
+function WithClock({ step = 0, children }) {
+  const time = useClock((t) => (step > 0 ? Math.floor(t / step) * step : t));
+  return children(time);
+}
+
+// Thin playback progress line along the bottom of the title bar (compositor-only: scaleX, no layout)
+function ClockProgressBar({ duration, palette }) {
+  const ratio = useClock((t) => (duration > 0 ? Math.min(1, Math.max(0, t / duration)) : 0));
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[2px] bg-white/[0.04]">
+      <div
+        className="h-full w-full origin-left"
+        style={{
+          transform: `scaleX(${ratio})`,
+          transition: 'transform 400ms linear',
+          willChange: 'transform',
+          background: `linear-gradient(to right, ${palette.hex600}, ${palette.hex400}, ${palette.hex200})`,
+          boxShadow: `0 0 8px ${palette.hex400}80`
+        }}
+      />
+    </div>
+  );
+}
+
 async function performOfflineSignalAnalysis(audioBlob, existingMeta = {}) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   if (!AudioCtx) {
@@ -1775,10 +1827,7 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [confirmModal, setConfirmModal] = useState(null);
 
-  // Desktop Companion (Mini Player) & Smart Metadata Audit State
-  const [isMiniPlayer, setIsMiniPlayer] = useState(false);
-  const [alwaysOnTop, setAlwaysOnTop] = useState(true);
-  const savedWindowSizeRef = useRef(null);
+  // Smart Metadata Audit State
   const [smartAuditResult, setSmartAuditResult] = useState(null);
 
   // 10-Band Parametric Equalizer State
@@ -1808,7 +1857,9 @@ export default function App() {
   const [queue, setQueue] = useState([]);
   const [currentTrackId, setCurrentTrackId] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
+  const setCurrentTime = playbackClock.set; // playback position lives in playbackClock, not in React state
+  const currentTimeRef = useRef(0);
+  const lastTimeUpdateSecRef = useRef(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(0.85);
   const [isMuted, setIsMuted] = useState(false);
@@ -1835,7 +1886,8 @@ export default function App() {
   const [rememberedFolder, setRememberedFolder] = useState({
     handle: null,
     name: null,
-    mode: null, // 'fs-handle' | 'idb-fallback'
+    path: null,
+    mode: null, // 'fs-handle' | 'idb-fallback' | 'tauri-native'
     permissionState: 'unknown', // 'granted' | 'prompt' | 'denied' | 'sandbox-fallback'
     trackCount: 0,
     lastScannedAt: null
@@ -1857,6 +1909,7 @@ export default function App() {
     ambientGlow: true,
     persistBlobsInIdb: true,
     rememberMusicFolder: true,
+    closeToTray: true,
     autoOnlineArtwork: true,
     autoOnlineLyrics: true,
     autoOnlineMetadata: true,
@@ -1869,6 +1922,8 @@ export default function App() {
     language: 'vi', // 'vi' | 'en'
     autoAlbumTheme: false
   });
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   const [showColorPickerPopover, setShowColorPickerPopover] = useState(false);
   const colorPickerRef = useRef(null);
   const [localCustomHex, setLocalCustomHex] = useState(settings.customAccentHex || '#f59e0b');
@@ -2029,7 +2084,32 @@ export default function App() {
   }, [windowHost, syncWindowState]);
 
   const runWindowAction = useCallback(
-    (action) => {
+    async (action) => {
+      if (action === 'close') {
+        const toTray = Boolean(settingsRef.current.closeToTray);
+        try {
+          await invoke('close_aurelia_window', { closeToTray: toTray });
+          if (toTray) {
+            showToast(t('closeToTrayDesc') || 'Aurelia đang tiếp tục phát nhạc trong Khay hệ thống.', 'info');
+          }
+          return;
+        } catch (e) {
+          // Native command fallback
+        }
+        if (toTray) {
+          try {
+            const win = typeof getCurrentWindow === 'function' ? getCurrentWindow() : null;
+            if (win && typeof win.hide === 'function') {
+              await win.hide().catch(() => { });
+              showToast(t('closeToTrayDesc') || 'Aurelia đang tiếp tục phát nhạc trong Khay hệ thống.', 'info');
+              return;
+            }
+          } catch (e) {
+            // fallback to windowHost
+          }
+        }
+      }
+
       if (!windowHost) {
         showToast('Window controls are not connected to a desktop shell (no Tauri API or window.aureliaWindow found).', 'error');
         return;
@@ -2046,7 +2126,7 @@ export default function App() {
         reportError(err);
       }
     },
-    [windowHost, showToast, syncWindowState]
+    [windowHost, showToast, syncWindowState, t]
   );
 
   // Double-clicking empty title bar space maximizes / restores (Electron and Tauri already do this natively)
@@ -2152,6 +2232,13 @@ export default function App() {
           }
           restoredUrl = URL.createObjectURL(saved.audioBlob);
           needsRelink = false;
+        } else if (saved.filePath && typeof convertFileSrc === 'function') {
+          try {
+            restoredUrl = convertFileSrc(saved.filePath);
+            needsRelink = false;
+          } catch (e) {
+            needsRelink = true;
+          }
         }
         const hasValidCover =
           typeof saved.coverUrl === 'string' &&
@@ -2245,7 +2332,8 @@ export default function App() {
         setRememberedFolder({
           handle: null,
           name: savedFolderRecord.name || 'Local Music Folder',
-          mode: 'native-folder',
+          path: savedFolderRecord.path || null,
+          mode: savedFolderRecord.mode || 'tauri-native',
           permissionState: 'granted',
           trackCount: savedFolderRecord.trackCount || 0,
           lastScannedAt: savedFolderRecord.lastScannedAt || null
@@ -2261,11 +2349,11 @@ export default function App() {
 
   // Persist PEQ state and custom presets to IndexedDB
   useEffect(() => {
-    dbPut('settings', { key: 'peqState', value: peqState }).catch(() => {});
+    dbPut('settings', { key: 'peqState', value: peqState }).catch(() => { });
   }, [peqState]);
 
   useEffect(() => {
-    dbPut('settings', { key: 'customPeqPresets', value: customPeqPresets }).catch(() => {});
+    dbPut('settings', { key: 'customPeqPresets', value: customPeqPresets }).catch(() => { });
   }, [customPeqPresets]);
 
   useEffect(() => {
@@ -2757,8 +2845,29 @@ export default function App() {
   useEffect(() => {
     let animationId;
     const freqData = new Uint8Array(256);
+    let lastDrawTime = 0;
+    const FRAME_INTERVAL = 1000 / 30; // Cap to 30 FPS for silky performance without GPU choke
 
-    const renderVisualizer = () => {
+    // Pre-calculate logarithmic frequency bin lookup for 52 visualizer bars
+    const BIN_INDICES = new Uint16Array(52);
+    for (let i = 0; i < 52; i++) {
+      BIN_INDICES[i] = Math.min(255, Math.floor(Math.pow(i / 52, 1.5) * 175));
+    }
+
+    // Pre-formatted palette colors
+    const pal = activePaletteRef.current || activePalette;
+    const r500 = (pal?.rgb500 || '245 158 11').replace(/ /g, ', ');
+    const r400 = (pal?.rgb400 || '251 191 36').replace(/ /g, ', ');
+    const r300 = (pal?.rgb300 || '253 224 71').replace(/ /g, ', ');
+
+    const renderVisualizer = (timestamp) => {
+      // Throttle rendering to ~30 FPS
+      if (timestamp - lastDrawTime < FRAME_INTERVAL) {
+        animationId = requestAnimationFrame(renderVisualizer);
+        return;
+      }
+      lastDrawTime = timestamp;
+
       const canvases = [
         visualizerCanvasRef.current,
         fullscreenVisualizerCanvasRef.current
@@ -2769,8 +2878,17 @@ export default function App() {
         if (analyser && isPlaying) {
           analyser.getByteFrequencyData(freqData);
         } else {
+          let hasRemainingEnergy = false;
           for (let i = 0; i < freqData.length; i++) {
-            freqData[i] = Math.max(0, Math.floor(freqData[i] * 0.86));
+            freqData[i] = Math.max(0, Math.floor(freqData[i] * 0.8));
+            if (freqData[i] > 0) hasRemainingEnergy = true;
+          }
+          if (!hasRemainingEnergy) {
+            canvases.forEach((canvas) => {
+              const ctx = canvas.getContext('2d');
+              if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+            });
+            return;
           }
         }
 
@@ -2781,38 +2899,28 @@ export default function App() {
           const height = canvas.height;
           ctx.clearRect(0, 0, width, height);
 
+          // Create gradient ONCE per canvas outside bar loop
+          const grad = ctx.createLinearGradient(0, height, 0, 0);
+          grad.addColorStop(0, `rgba(${r500}, 0.22)`);
+          grad.addColorStop(0.6, `rgba(${r400}, 0.68)`);
+          grad.addColorStop(1, `rgba(${r300}, 0.92)`);
+          ctx.fillStyle = grad;
+
           const barCount = 52;
           const gap = 3;
           const barWidth = Math.max(2, (width - gap * (barCount - 1)) / barCount);
 
+          // Batch all bar rectangles into a SINGLE canvas draw path
+          ctx.beginPath();
           for (let i = 0; i < barCount; i++) {
-            const binIdx = Math.min(
-              freqData.length - 1,
-              Math.floor(Math.pow(i / barCount, 1.5) * 175)
-            );
+            const binIdx = BIN_INDICES[i];
             const val = freqData[binIdx] / 255;
             const barH = Math.max(2, val * (height - 4));
             const x = i * (barWidth + gap);
             const y = height - barH;
-
-            const pal = activePaletteRef.current || activePalette;
-            const r500 = (pal?.rgb500 || '245 158 11').split(' ').join(', ');
-            const r400 = (pal?.rgb400 || '251 191 36').split(' ').join(', ');
-            const r300 = (pal?.rgb300 || '253 224 71').split(' ').join(', ');
-
-            const grad = ctx.createLinearGradient(0, height, 0, 0);
-            grad.addColorStop(0, `rgba(${r500}, 0.22)`);
-            grad.addColorStop(0.6, `rgba(${r400}, 0.68)`);
-            grad.addColorStop(1, `rgba(${r300}, 0.92)`);
-            ctx.fillStyle = grad;
-            ctx.beginPath();
-            if (typeof ctx.roundRect === 'function') {
-              ctx.roundRect(x, y, barWidth, barH, 1.5);
-            } else {
-              ctx.rect(x, y, barWidth, barH);
-            }
-            ctx.fill();
+            ctx.rect(x, y, barWidth, barH);
           }
+          ctx.fill();
         });
       }
       animationId = requestAnimationFrame(renderVisualizer);
@@ -3108,6 +3216,8 @@ export default function App() {
     const clamped = Math.max(0, Math.min(audio.duration || duration || 0, newTimeSec));
     cancelHandoff();
     audio.currentTime = clamped;
+    currentTimeRef.current = clamped;
+    lastTimeUpdateSecRef.current = clamped;
     setCurrentTime(clamped);
   }, [duration, cancelHandoff]);
 
@@ -3222,12 +3332,19 @@ export default function App() {
   const handleDeckTimeUpdate = (e) => {
     const audio = e.currentTarget;
     if (audio !== audioRef.current) return;
-    setCurrentTime(audio.currentTime);
+    const nowSec = audio.currentTime;
+    currentTimeRef.current = nowSec;
+
+    // Throttle React state updates to ~400ms to keep progress smooth without choking CPU
+    if (Math.abs(nowSec - lastTimeUpdateSecRef.current) >= 0.4 || audio.paused || nowSec === 0) {
+      lastTimeUpdateSecRef.current = nowSec;
+      setCurrentTime(nowSec);
+    }
 
     if (!settings.gapless || audio.paused || handoffTimerRef.current) return;
     const dur = audio.duration;
     if (!Number.isFinite(dur) || dur < 2) return;
-    const remaining = dur - audio.currentTime;
+    const remaining = dur - nowSec;
     if (remaining > 1.5 || remaining <= 0) return;
     const pre = preloadedRef.current;
     const idle = pre ? deckElsRef.current[pre.idx] : null;
@@ -3274,10 +3391,13 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (currentTrack && !currentTrack.dspAnalysis && currentTrack.audioBlob && !isAnalyzingDsp) {
-      runTrackDspAnalysis(currentTrack);
+    if (activeTab === 'insights' && currentTrack && !currentTrack.dspAnalysis && currentTrack.audioBlob && !isAnalyzingDsp) {
+      const timer = setTimeout(() => {
+        runTrackDspAnalysis(currentTrack);
+      }, 350);
+      return () => clearTimeout(timer);
     }
-  }, [currentTrack, isAnalyzingDsp, runTrackDspAnalysis]);
+  }, [activeTab, currentTrack, isAnalyzingDsp, runTrackDspAnalysis]);
 
   const processNormalizedImportEntries = useCallback(
     async (rawEntries, sourceFolderName = null, stats = { folders: 0, errors: 0, skippedNonAudio: 0 }) => {
@@ -3424,10 +3544,13 @@ export default function App() {
 
         if (existingTrack) {
           if (existingTrack.needsRelink || !existingTrack.objectUrl) {
-            const newUrl = URL.createObjectURL(file);
+            const newUrl = file.filePath && typeof convertFileSrc === 'function'
+              ? convertFileSrc(file.filePath)
+              : (file instanceof Blob ? URL.createObjectURL(file) : existingTrack.objectUrl);
             const updatedExisting = {
               ...existingTrack,
-              audioBlob: file,
+              filePath: file.filePath || existingTrack.filePath || null,
+              audioBlob: file.filePath ? null : file,
               objectUrl: newUrl,
               needsRelink: false
             };
@@ -3435,7 +3558,7 @@ export default function App() {
             await dbPut('tracks', {
               ...updatedExisting,
               objectUrl: null,
-              audioBlob: settings.persistBlobsInIdb ? file : null
+              audioBlob: file.filePath ? null : (settings.persistBlobsInIdb ? file : null)
             });
             relinkedCount++;
           } else {
@@ -3443,7 +3566,9 @@ export default function App() {
           }
         } else {
           try {
-            const objectUrl = URL.createObjectURL(file);
+            const objectUrl = file.filePath && typeof convertFileSrc === 'function'
+              ? convertFileSrc(file.filePath)
+              : URL.createObjectURL(file);
 
             // Share verified embedded artwork across tracks belonging to the same album
             if (meta.isArtworkVerified && meta.coverUrl) {
@@ -3517,8 +3642,9 @@ export default function App() {
               channels: meta.channels,
               channelsSource: meta.channelsSource,
               duration: probedDuration,
+              filePath: file.filePath || null,
               fileSize: file.size,
-              audioBlob: file,
+              audioBlob: file.filePath ? null : file,
               objectUrl,
               coverUrl,
               coverProvenance,
@@ -3537,7 +3663,7 @@ export default function App() {
             await dbPut('tracks', {
               ...trackObj,
               objectUrl: null,
-              audioBlob: settings.persistBlobsInIdb ? file : null
+              audioBlob: file.filePath ? null : (settings.persistBlobsInIdb ? file : null)
             });
           } catch (fileErr) {
             errorCount++;
@@ -3585,6 +3711,7 @@ export default function App() {
         }.`,
         'success'
       );
+      setImportProgress(null);
     },
     [tracks, settings.persistBlobsInIdb, showToast]
   );
@@ -3647,32 +3774,146 @@ export default function App() {
     [processNormalizedImportEntries, settings.rememberMusicFolder]
   );
 
-  const handleSelectOrRestoreFolder = useCallback(async () => {
-    // 1. Desktop shell / Tauri: Use native OS dialog via rfd (zero browser upload prompts)
+  const handleScanAndImportNativeFolder = useCallback(
+    async (folderPath) => {
+      if (!folderPath) return;
+      const folderName = folderPath.split(/[/\\]/).filter(Boolean).pop() || folderPath;
+
+      setImportProgress({
+        active: true,
+        folderName,
+        foldersScanned: 1,
+        totalDiscovered: 0,
+        processed: 0,
+        imported: 0,
+        relinked: 0,
+        duplicatesSkipped: 0,
+        unsupportedSkipped: 0,
+        errors: 0,
+        currentFile: 'Đang quét thư mục và các thư mục con...'
+      });
+
+      try {
+        let discoveredFiles = [];
+        try {
+          discoveredFiles = await invoke('scan_music_folder', { folderPath });
+        } catch (err) {
+          showToast(`Lỗi quét thư mục: ${err?.message || err}`, 'error');
+          return;
+        }
+
+        if (!discoveredFiles || discoveredFiles.length === 0) {
+          showToast(`Không tìm thấy file nhạc hợp lệ (.mp3, .flac, .wav, .m4a,...) trong "${folderName}".`, 'info');
+          return;
+        }
+
+        const mimeMap = {
+          mp3: 'audio/mpeg',
+          flac: 'audio/flac',
+          wav: 'audio/wav',
+          m4a: 'audio/mp4; codecs="mp4a.40.2"',
+          aac: 'audio/aac',
+          ogg: 'audio/ogg',
+          opus: 'audio/ogg; codecs="opus"',
+          alac: 'audio/mp4',
+          aiff: 'audio/aiff',
+          aif: 'audio/aiff'
+        };
+
+        const rawEntries = [];
+        for (const item of discoveredFiles) {
+          const extLower = (item.extension || '').toLowerCase();
+          let headerBlob = null;
+          try {
+            const maxHeader = Math.min(Number(item.size), 3 * 1024 * 1024);
+            const bytes = await invoke('read_file_header', { path: item.path, maxBytes: maxHeader });
+            headerBlob = new Blob([new Uint8Array(bytes)]);
+          } catch (e) {
+            headerBlob = new Blob([]);
+          }
+
+          const fileProxy = {
+            name: item.name,
+            size: Number(item.size),
+            type: mimeMap[extLower] || 'audio/mpeg',
+            filePath: item.path,
+            slice: (start, end) => headerBlob.slice(start, end)
+          };
+
+          rawEntries.push({
+            file: fileProxy,
+            relativePath: item.relative_path,
+            nativePath: item.path
+          });
+        }
+
+        const nowIso = new Date().toISOString();
+        const folderMeta = {
+          key: 'musicFolder',
+          handle: null,
+          name: folderName,
+          path: folderPath,
+          mode: 'tauri-native',
+          trackCount: rawEntries.length,
+          lastScannedAt: nowIso
+        };
+        await dbPut('handles', folderMeta).catch(() => { });
+        setRememberedFolder({
+          handle: null,
+          name: folderName,
+          path: folderPath,
+          mode: 'tauri-native',
+          permissionState: 'granted',
+          trackCount: rawEntries.length,
+          lastScannedAt: nowIso
+        });
+
+        await processNormalizedImportEntries(rawEntries, folderName, {
+          folders: 1,
+          errors: 0,
+          skippedNonAudio: 0
+        });
+      } finally {
+        setImportProgress(null);
+      }
+    },
+    [processNormalizedImportEntries, showToast]
+  );
+
+  const handlePickAndImportFolder = useCallback(async () => {
     if (typeof window !== 'undefined' && (window.__TAURI__ || window.__TAURI_INTERNALS__)) {
       try {
         const picked = await invoke('pick_music_folder');
         if (picked) {
-          const folderName = picked.split(/[/\\]/).filter(Boolean).pop() || picked;
-          setRememberedFolder({
-            handle: null,
-            name: folderName,
-            mode: 'tauri-native',
-            permissionState: 'granted',
-            trackCount: tracks.length,
-            lastScannedAt: new Date().toISOString()
-          });
-          showToast(`Đã chọn thư mục: ${folderName}`, 'info');
+          await handleScanAndImportNativeFolder(picked);
           return;
         }
       } catch (err) {
         console.warn('Native folder picker fallback:', err);
       }
     }
-
-    // 2. Browser: open file picker where selecting audio files (Ctrl+A in folder) never triggers "Only do this if you trust the site"
     fileInputRef.current?.click();
-  }, [tracks.length, showToast]);
+  }, [handleScanAndImportNativeFolder]);
+
+  const handleRescanFolder = useCallback(async () => {
+    if (rememberedFolder?.path) {
+      await handleScanAndImportNativeFolder(rememberedFolder.path);
+    } else {
+      await handlePickAndImportFolder();
+    }
+  }, [rememberedFolder?.path, handleScanAndImportNativeFolder, handlePickAndImportFolder]);
+
+  const handleSelectOrRestoreFolder = useCallback(async (forcedArg = null) => {
+    if (typeof forcedArg === 'string') {
+      await handleScanAndImportNativeFolder(forcedArg);
+      return;
+    }
+    if (forcedArg === true && rememberedFolder?.path) {
+      await handleScanAndImportNativeFolder(rememberedFolder.path);
+      return;
+    }
+    await handlePickAndImportFolder();
+  }, [handleScanAndImportNativeFolder, handlePickAndImportFolder, rememberedFolder]);
 
   const handleForgetRememberedFolder = useCallback(async () => {
     await dbDelete('handles', 'musicFolder');
@@ -3801,7 +4042,7 @@ export default function App() {
               }
             }
             const updatedPl = { ...pl, trackIds: updatedIds };
-            dbPut('playlists', updatedPl).catch(() => {});
+            dbPut('playlists', updatedPl).catch(() => { });
             return updatedPl;
           });
         });
@@ -3830,7 +4071,7 @@ export default function App() {
         for (const item of album.tracks) {
           try {
             await dbDelete('tracks', item.id);
-          } catch (e) {}
+          } catch (e) { }
         }
 
         const remainingTracks = tracks.filter((item) => !albumTrackIds.has(item.id));
@@ -3854,7 +4095,7 @@ export default function App() {
             if (!Array.isArray(pl.trackIds)) return pl;
             const updatedIds = pl.trackIds.filter((id) => !albumTrackIds.has(id));
             const updatedPl = { ...pl, trackIds: updatedIds };
-            dbPut('playlists', updatedPl).catch(() => {});
+            dbPut('playlists', updatedPl).catch(() => { });
             return updatedPl;
           });
         });
@@ -3875,7 +4116,7 @@ export default function App() {
       onConfirm: async () => {
         try {
           await dbDelete('tracks', trackId);
-        } catch (e) {}
+        } catch (e) { }
 
         const remainingTracks = tracks.filter((item) => item.id !== trackId);
         setTracks(remainingTracks);
@@ -3896,7 +4137,7 @@ export default function App() {
             if (!Array.isArray(pl.trackIds)) return pl;
             const updatedIds = pl.trackIds.filter((id) => id !== trackId);
             const updatedPl = { ...pl, trackIds: updatedIds };
-            dbPut('playlists', updatedPl).catch(() => {});
+            dbPut('playlists', updatedPl).catch(() => { });
             return updatedPl;
           });
         });
@@ -3917,64 +4158,6 @@ export default function App() {
     }
     return null;
   }, []);
-
-  const handleEnterMiniPlayer = useCallback(async () => {
-    const win = getTauriAppWindow();
-    if (win) {
-      try {
-        const curSize = await win.innerSize();
-        if (curSize && curSize.width > 420) {
-          savedWindowSizeRef.current = curSize;
-        }
-        await win.setAlwaysOnTop(alwaysOnTop);
-        await win.setSize(new LogicalSize(380, 160));
-      } catch (e) {
-        console.warn('Could not resize window for mini player:', e);
-      }
-    }
-    setIsMiniPlayer(true);
-  }, [alwaysOnTop, getTauriAppWindow]);
-
-  const handleExitMiniPlayer = useCallback(async () => {
-    const win = getTauriAppWindow();
-    if (win) {
-      try {
-        await win.setAlwaysOnTop(false);
-        if (savedWindowSizeRef.current) {
-          await win.setSize(savedWindowSizeRef.current);
-        } else {
-          await win.setSize(new LogicalSize(1120, 760));
-        }
-      } catch (e) {
-        console.warn('Could not restore window size:', e);
-      }
-    }
-    setIsMiniPlayer(false);
-  }, [getTauriAppWindow]);
-
-  const handleToggleAlwaysOnTop = useCallback(async () => {
-    const next = !alwaysOnTop;
-    setAlwaysOnTop(next);
-    const win = getTauriAppWindow();
-    if (win) {
-      try {
-        await win.setAlwaysOnTop(next);
-      } catch (e) {
-        console.warn('Could not toggle always on top:', e);
-      }
-    }
-  }, [alwaysOnTop, getTauriAppWindow]);
-
-  const handleHideToTray = useCallback(async () => {
-    const win = getTauriAppWindow();
-    if (win) {
-      try {
-        await win.hide();
-      } catch (e) {
-        console.warn('Could not hide window:', e);
-      }
-    }
-  }, [getTauriAppWindow]);
 
   // Smart Metadata Inconsistency Scan
   const handleRunSmartMetadataAudit = useCallback(() => {
@@ -4260,11 +4443,11 @@ export default function App() {
     setSmartAuditResult((prev) =>
       prev
         ? {
-            ...prev,
-            healthScore: 100,
-            totalDiscrepancies: 0,
-            albumIssues: []
-          }
+          ...prev,
+          healthScore: 100,
+          totalDiscrepancies: 0,
+          albumIssues: []
+        }
         : null
     );
   }, [smartAuditResult, settings.persistBlobsInIdb, showToast, t]);
@@ -4392,11 +4575,6 @@ export default function App() {
 
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if (e.key === 'Escape' && isMiniPlayer) {
-        e.preventDefault();
-        handleExitMiniPlayer();
-        return;
-      }
       if (e.key === 'Escape' && fullscreenMode !== null) {
         e.preventDefault();
         exitFullscreenMode();
@@ -4412,10 +4590,10 @@ export default function App() {
         togglePlayPause();
       } else if (e.code === 'ArrowRight' || e.key === 'l' || e.key === 'L') {
         e.preventDefault();
-        handleSeek(currentTime + 5);
+        handleSeek(currentTimeRef.current + 5);
       } else if (e.code === 'ArrowLeft' || e.key === 'j' || e.key === 'J') {
         e.preventDefault();
-        handleSeek(currentTime - 5);
+        handleSeek(currentTimeRef.current - 5);
       } else if (e.code === 'ArrowUp') {
         e.preventDefault();
         setVolume((v) => Math.min(1, Number((v + 0.05).toFixed(2))));
@@ -4434,31 +4612,119 @@ export default function App() {
       } else if (e.key === 'f' || e.key === 'F') {
         e.preventDefault();
         toggleFullscreenMode('player');
+      } else if (['1', '2', '3', '4'].includes(e.key) && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        const eqPresetsMap = {
+          '1': 'builtin-flat',
+          '2': 'builtin-warm',
+          '3': 'builtin-bright',
+          '4': 'builtin-vocal'
+        };
+        const targetId = eqPresetsMap[e.key];
+        const found = BUILTIN_PEQ_PRESETS.find((p) => p.id === targetId);
+        if (found) {
+          setPeqState((prev) => ({
+            ...prev,
+            enabled: true,
+            activePresetId: found.id,
+            preamp: found.preamp,
+            bands: found.bands.map((b) => ({ ...b }))
+          }));
+          const labelMap = { '1': 'Linear (Flat)', '2': 'Warmth', '3': 'Air', '4': 'Vocal' };
+          showToast(`Profile Equalizer: ${labelMap[e.key]}`, 'info');
+        }
+      } else if (e.key === 'e' || e.key === 'E') {
+        e.preventDefault();
+        setPeqState((prev) => {
+          const next = !prev.enabled;
+          showToast(next ? '10-Band EQ: Bật' : '10-Band EQ: Tắt (Bypass)', 'info');
+          return { ...prev, enabled: next };
+        });
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
-    isMiniPlayer,
-    handleExitMiniPlayer,
     fullscreenMode,
     exitFullscreenMode,
     settings.keyboardShortcuts,
     togglePlayPause,
     handleSeek,
-    currentTime,
-    toggleFullscreenMode
+    toggleFullscreenMode,
+    showToast
   ]);
+
+  // Handle native window close-to-tray & tray menu commands
+  useEffect(() => {
+    const win = getTauriAppWindow();
+    let unlistenClose = null;
+    let unlistenTray = null;
+
+    if (win && typeof win.onCloseRequested === 'function') {
+      win.onCloseRequested((event) => {
+        if (settingsRef.current.closeToTray) {
+          event.preventDefault();
+          win.hide().catch(() => { });
+          showToast(t('closeToTrayDesc') || 'Aurelia đang tiếp tục phát nhạc trong Khay hệ thống.', 'info');
+        }
+      }).then((u) => {
+        unlistenClose = u;
+      }).catch(() => { });
+    }
+
+    if (typeof listen === 'function') {
+      listen('tray-command', (event) => {
+        const cmd = event.payload;
+        if (cmd === 'play_pause') {
+          togglePlayPause();
+        } else if (cmd === 'next') {
+          handleNextTrack(false);
+        } else if (cmd === 'prev') {
+          handlePrevTrack();
+        }
+      }).then((u) => {
+        unlistenTray = u;
+      }).catch(() => { });
+    }
+
+    return () => {
+      if (typeof unlistenClose === 'function') unlistenClose();
+      if (typeof unlistenTray === 'function') unlistenTray();
+    };
+  }, [getTauriAppWindow, showToast, t, togglePlayPause, handleNextTrack, handlePrevTrack]);
+
+  // Synchronize System Tray metadata & playback status
+  useEffect(() => {
+    try {
+      invoke('update_tray_track', {
+        title: currentTrack?.title || null,
+        artist: currentTrack?.artist || null,
+        isPlaying: Boolean(isPlaying)
+      }).catch(() => { });
+    } catch (e) {
+      // ignore
+    }
+  }, [currentTrack?.title, currentTrack?.artist, isPlaying]);
+
+  // Synchronize close-to-tray preference with native backend
+  useEffect(() => {
+    try {
+      invoke('set_close_to_tray', { enable: Boolean(settings.closeToTray) }).catch(() => { });
+    } catch (e) {
+      // ignore
+    }
+  }, [settings.closeToTray]);
 
   const parsedLyrics = useMemo(() => {
     return parseLrcLyrics(currentTrack?.lyrics || '');
   }, [currentTrack?.lyrics]);
 
-  const activeLyricIndex = useMemo(() => {
+  const lyricOffsetSec = (currentTrack?.lyricsOffsetMs || 0) / 1000;
+  // Re-renders App only when the highlighted line actually changes, not on every time tick
+  const activeLyricIndex = useClock((time) => {
     if (!parsedLyrics.isSynced || parsedLyrics.lines.length === 0) return -1;
-    const offsetSec = (currentTrack?.lyricsOffsetMs || 0) / 1000;
-    const adjustedTime = currentTime - offsetSec;
+    const adjustedTime = time - lyricOffsetSec;
     let activeIdx = -1;
     for (let i = 0; i < parsedLyrics.lines.length; i++) {
       const lineTime = parsedLyrics.lines[i].timeSec;
@@ -4469,7 +4735,13 @@ export default function App() {
       }
     }
     return activeIdx;
-  }, [parsedLyrics, currentTime, currentTrack?.lyricsOffsetMs]);
+  });
+  // Plain (unsynced) lyrics: estimated line from track progress, again only changes a few times per song
+  const unsyncedLyricIdx = useClock((time) => {
+    if (parsedLyrics.isSynced || parsedLyrics.lines.length === 0) return -1;
+    const progress = duration > 0 ? Math.min(0.999, Math.max(0, time / duration)) : 0;
+    return Math.floor(progress * parsedLyrics.lines.length);
+  });
   // Compute the active window of lyrics for the non-scrolling Now Playing & Fullscreen lyrics viewports
   const visibleLyricsWindow = useMemo(() => {
     const lines = parsedLyrics.lines;
@@ -4477,8 +4749,7 @@ export default function App() {
     const windowSize = 3;
     if (!parsedLyrics.isSynced) {
       // For plain unsynced lyrics, estimate active line from track progress so user never has to scroll manually
-      const progress = duration > 0 ? Math.min(0.999, Math.max(0, currentTime / duration)) : 0;
-      const approxIdx = Math.floor(progress * lines.length);
+      const approxIdx = Math.max(0, unsyncedLyricIdx);
       const start = Math.max(0, Math.min(Math.max(0, lines.length - windowSize), approxIdx - 1));
       return lines.slice(start, start + windowSize).map((l, idx) => ({
         ...l,
@@ -4504,7 +4775,7 @@ export default function App() {
                 : 'upcoming';
       return { ...l, globalIdx: gIdx, role };
     });
-  }, [parsedLyrics, activeLyricIndex, currentTime, duration]);
+  }, [parsedLyrics, activeLyricIndex, unsyncedLyricIdx]);
 
   const filteredTracks = useMemo(() => {
     let list = tracks;
@@ -4798,61 +5069,6 @@ export default function App() {
         }
       }}
     >
-      {/* Theme-Matched Custom Chromium & Firefox Scrollbar Styles */}
-      <style>{`
-        .aurelia-scrollbar {
-          scrollbar-width: thin;
-          scrollbar-color: rgba(245, 158, 11, 0.28) rgba(255, 255, 255, 0.02);
-        }
-        .aurelia-scrollbar::-webkit-scrollbar {
-          width: 6px;
-          height: 6px;
-        }
-        .aurelia-scrollbar::-webkit-scrollbar-track {
-          background: rgba(255, 255, 255, 0.02);
-          border-radius: 9999px;
-        }
-        .aurelia-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.16);
-          border-radius: 9999px;
-          border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-        .aurelia-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: rgba(245, 158, 11, 0.55);
-        }
-        .aurelia-scrollbar::-webkit-scrollbar-corner {
-          background: transparent;
-        }
-        .no-scrollbar {
-          -ms-overflow-style: none;
-          scrollbar-width: none;
-        }
-        .no-scrollbar::-webkit-scrollbar {
-          display: none;
-        }
-        /* Hide every visible scrollbar without disabling scrolling */
-        html,
-        body,
-        #root,
-        * {
-          scrollbar-width: none !important;
-          -ms-overflow-style: none !important;
-        }
-        *::-webkit-scrollbar,
-        *::-webkit-scrollbar-track,
-        *::-webkit-scrollbar-thumb,
-        *::-webkit-scrollbar-corner {
-          display: none !important;
-          width: 0 !important;
-          height: 0 !important;
-          background: transparent !important;
-        }
-        /* Title bar equalizer */
-        @keyframes aurelia-eq {
-          0%, 100% { transform: scaleY(0.22); }
-          50% { transform: scaleY(1); }
-        }
-      `}</style>
 
       {/* Hidden Audio Element & File Pickers */}
       {[0, 1].map((deckIdx) => (
@@ -4932,12 +5148,27 @@ export default function App() {
         }}
       />
 
+      {/* Performance: backdrop-filter makes the GPU re-blur every glass panel on each frame while anything on
+          screen animates (visualizer, spinning disc, pulsing dot, equalizer bars), which is what made playback laggy.
+          All glass surfaces sit over already heavily blurred artwork or are at least 75% opaque, so dropping the
+          backdrop blur is visually imperceptible. Delete this block to restore it. */}
+      <style>{`
+        .aurelia-glass-panel,
+        .aurelia-glass-header,
+        .aurelia-player-centerpiece,
+        [class*='backdrop-blur'] {
+          -webkit-backdrop-filter: none !important;
+          backdrop-filter: none !important;
+        }
+      `}</style>
+
       {/* Full-Window Dynamic Album Artwork Crossfading Backdrop */}
       <div className="pointer-events-none fixed inset-0 overflow-hidden z-0">
         {backdropState.prevUrl && (
           <img
             src={backdropState.prevUrl}
             alt=""
+            style={{ transform: 'translateZ(0)', willChange: 'opacity' }}
             className={`absolute inset-0 w-full h-full object-cover scale-125 blur-[95px] transition-opacity duration-1000 ease-out ${backdropState.transitioning ? 'opacity-30' : 'opacity-0'
               }`}
           />
@@ -4946,17 +5177,18 @@ export default function App() {
           <img
             src={backdropState.activeUrl}
             alt=""
+            style={{ transform: 'translateZ(0)', willChange: 'opacity' }}
             className="absolute inset-0 w-full h-full object-cover scale-125 blur-[95px] opacity-30 transition-all duration-1000 ease-out"
           />
         )}
         <div className="absolute inset-0 aurelia-backdrop-overlay bg-gradient-to-b from-[#07080c]/80 via-[#07080c]/88 to-[#07080c]/98" />
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_25%_20%,rgba(245,158,11,0.09),transparent_55%),radial-gradient(circle_at_80%_75%,rgba(56,189,248,0.08),transparent_55%)]" />
         {settings.ambientGlow && (
-          <>
+          <div style={{ transform: 'translateZ(0)' }} className="pointer-events-none">
             <div className="absolute -top-36 -left-36 w-[520px] h-[520px] rounded-full bg-amber-500/10 blur-[135px]" />
             <div className="absolute top-1/4 right-0 w-[460px] h-[460px] rounded-full bg-sky-500/10 blur-[140px]" />
             <div className="absolute bottom-0 left-1/3 w-[500px] h-[380px] rounded-full bg-purple-600/10 blur-[150px]" />
-          </>
+          </div>
         )}
       </div>
 
@@ -5026,12 +5258,16 @@ export default function App() {
             </div>
           </div>
 
-          {/* Now playing (compact title on phones, capsule from md up) */}
+          {/* Now playing (compact title on phones, Interactive Dynamic Island from md up) */}
           <span className="pointer-events-none md:hidden flex-1 min-w-0 truncate text-xs text-zinc-400 text-right">
             {currentTrack ? currentTrack.title : ''}
           </span>
-          <div className="pointer-events-none hidden md:flex items-center justify-center min-w-0">
-            <div className="flex items-center gap-3 max-w-full min-w-0 px-4 py-1 rounded-full bg-black/30 border border-white/10 shadow-inner shadow-black/40">
+          <div className="hidden md:flex items-center justify-center min-w-0">
+            <div
+              style={NO_DRAG_STYLE}
+              className="group pointer-events-auto flex items-center gap-2.5 max-w-full min-w-0 px-3.5 py-1 rounded-full transition-all duration-300 ease-out shadow-lg bg-black/30 dark:bg-black/40 border border-white/10 shadow-inner shadow-black/40 hover:bg-zinc-900/95 dark:hover:bg-black/90 hover:border-amber-500/40 hover:shadow-amber-500/10 hover:scale-[1.02]"
+            >
+              {/* Soundwave Visualizer Bars */}
               <span className="flex items-end gap-[3px] h-3.5 shrink-0" aria-hidden="true">
                 {[0, 1, 2, 3].map((i) => (
                   <span
@@ -5046,30 +5282,57 @@ export default function App() {
                   />
                 ))}
               </span>
-              <div className="min-w-0 flex items-baseline gap-2">
+
+              {/* Track Title & Artist */}
+              <div className="min-w-0 flex items-baseline gap-1.5 max-w-[200px] lg:max-w-[280px]">
                 <span className={`truncate text-xs font-semibold ${currentTrack ? 'text-zinc-100' : 'text-zinc-500'}`}>
                   {currentTrack ? currentTrack.title : t('nothingPlaying')}
                 </span>
                 {currentTrack?.artist && (
-                  <span className="truncate text-[11px] text-zinc-400">{currentTrack.artist}</span>
+                  <span className="hidden sm:inline truncate text-[11px] text-zinc-400">
+                    • {currentTrack.artist}
+                  </span>
                 )}
+              </div>
+
+              {/* Quick Hover Controls (Previous, Play/Pause, Next, Mini Player Toggle) */}
+              <div className="flex items-center gap-1 transition-all duration-300 ease-out overflow-hidden opacity-0 max-w-0 pointer-events-none group-hover:opacity-100 group-hover:max-w-[140px] group-hover:pointer-events-auto group-hover:ml-1 group-hover:pl-1.5 group-hover:border-l group-hover:border-white/15">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handlePrevTrack();
+                  }}
+                  className="p-1 rounded-full hover:bg-white/10 text-zinc-300 hover:text-white transition"
+                  title={t('prevTrack')}
+                >
+                  <SkipBack className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    togglePlayPause();
+                  }}
+                  className="p-1 rounded-full bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold transition shadow-sm"
+                  title={isPlaying ? t('pause') : t('play')}
+                >
+                  {isPlaying ? <Pause className="w-3 h-3 fill-current" /> : <Play className="w-3 h-3 fill-current ml-0.5" />}
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleNextTrack(false);
+                  }}
+                  className="p-1 rounded-full hover:bg-white/10 text-zinc-300 hover:text-white transition"
+                  title={t('nextTrack')}
+                >
+                  <SkipForward className="w-3 h-3" />
+                </button>
               </div>
             </div>
           </div>
 
           {/* Quick actions & Window controls */}
           <div className="pointer-events-none flex items-center justify-end shrink-0 md:shrink self-stretch gap-1.5">
-            <button
-              style={NO_DRAG_STYLE}
-              onClick={handleEnterMiniPlayer}
-              className="pointer-events-auto h-7 px-2.5 my-auto rounded-lg bg-white/5 hover:bg-amber-500/20 border border-white/10 hover:border-amber-400/40 text-zinc-300 hover:text-amber-300 flex items-center gap-1.5 transition text-xs font-medium"
-              title={t('desktopCompanion')}
-              aria-label={t('desktopCompanion')}
-            >
-              <Pin className="w-3.5 h-3.5 text-amber-400" />
-              <span className="hidden sm:inline">{t('miniPlayer')}</span>
-            </button>
-
             {showWindowControls && (
               <div
                 style={NO_DRAG_STYLE}
@@ -5117,16 +5380,7 @@ export default function App() {
           </div>
 
           {/* Playback progress hairline along the bottom edge */}
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[2px] bg-white/[0.04]">
-            <div
-              className="h-full transition-[width] duration-300 ease-linear"
-              style={{
-                width: `${duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0}%`,
-                background: `linear-gradient(to right, ${activePalette.hex600}, ${activePalette.hex400}, ${activePalette.hex200})`,
-                boxShadow: `0 0 8px ${activePalette.hex400}80`
-              }}
-            />
-          </div>
+          <ClockProgressBar duration={duration} palette={activePalette} />
         </div>
 
         {/* Navigation + import row */}
@@ -5175,11 +5429,10 @@ export default function App() {
             <div className="relative" ref={colorPickerRef}>
               <button
                 onClick={() => setShowColorPickerPopover((prev) => !prev)}
-                className={`p-2 rounded-xl border transition flex items-center justify-center gap-1.5 ${
-                  showColorPickerPopover
-                    ? 'bg-white/10 border-white/20 text-white shadow-sm'
-                    : 'bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 border-white/10'
-                }`}
+                className={`p-2 rounded-xl border transition flex items-center justify-center gap-1.5 ${showColorPickerPopover
+                  ? 'bg-white/10 border-white/20 text-white shadow-sm'
+                  : 'bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 border-white/10'
+                  }`}
                 title={t('accentColorQuick')}
                 aria-label={t('accentColorQuick')}
               >
@@ -5199,11 +5452,10 @@ export default function App() {
                       <button
                         key={pal.id}
                         onClick={() => updateSetting('accentColor', pal.id)}
-                        className={`w-5 h-5 rounded-full transition-all flex items-center justify-center shrink-0 ${
-                          isSelected
-                            ? 'ring-2 ring-white ring-offset-2 ring-offset-zinc-950 scale-110'
-                            : 'opacity-70 hover:opacity-100 hover:scale-110'
-                        }`}
+                        className={`w-5 h-5 rounded-full transition-all flex items-center justify-center shrink-0 ${isSelected
+                          ? 'ring-2 ring-white ring-offset-2 ring-offset-zinc-950 scale-110'
+                          : 'opacity-70 hover:opacity-100 hover:scale-110'
+                          }`}
                         style={{ backgroundColor: pal.swatch }}
                         title={pal.label}
                       />
@@ -5218,9 +5470,8 @@ export default function App() {
                       handleExtractAlbumColor();
                       setShowColorPickerPopover(false);
                     }}
-                    className={`p-1 rounded-lg transition-all flex items-center justify-center shrink-0 ${
-                      currentTrack?.coverUrl ? 'hover:scale-110 text-amber-300 hover:bg-white/10' : 'opacity-40 text-zinc-500 cursor-not-allowed'
-                    }`}
+                    className={`p-1 rounded-lg transition-all flex items-center justify-center shrink-0 ${currentTrack?.coverUrl ? 'hover:scale-110 text-amber-300 hover:bg-white/10' : 'opacity-40 text-zinc-500 cursor-not-allowed'
+                      }`}
                     title={t('colorFromAlbum')}
                   >
                     <Sparkles className="w-3.5 h-3.5" />
@@ -5236,16 +5487,6 @@ export default function App() {
             >
               <Upload className="w-3.5 h-3.5" />
               <span>{t('importFiles')}</span>
-            </button>
-            <button
-              onClick={() => handleSelectOrRestoreFolder(null)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/[0.05] hover:bg-white/10 text-zinc-200 border border-white/10 text-xs font-medium transition"
-              title={rememberedFolder.name ? `${t('musicFolder')}: ${rememberedFolder.name}` : t('selectMusicFolder')}
-            >
-              <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
-              <span className="hidden md:inline max-w-[140px] truncate">
-                {rememberedFolder.name || t('musicFolder')}
-              </span>
             </button>
           </div>
         </div>
@@ -5318,14 +5559,6 @@ export default function App() {
                   aria-label="Player Fullscreen"
                 >
                   <Maximize2 className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  onClick={handleEnterMiniPlayer}
-                  className="p-2 rounded-xl bg-black/35 hover:bg-black/60 text-zinc-300 hover:text-amber-300 border border-white/10 transition"
-                  title={t('desktopCompanion')}
-                  aria-label={t('desktopCompanion')}
-                >
-                  <Pin className="w-3.5 h-3.5" />
                 </button>
               </div>
             </div>
@@ -5432,25 +5665,34 @@ export default function App() {
                 ref={visualizerCanvasRef}
                 width={420}
                 height={42}
+                style={{ transform: 'translateZ(0)', willChange: 'contents' }}
                 className="w-full h-[42px] block pointer-events-none"
               />
 
               {/* Seek / Progress Bar */}
               <div className="flex items-center gap-2.5 pt-1 border-t border-white/10">
-                <span className="text-[11px] font-mono w-9 text-right shrink-0" style={{ color: activePalette?.hex300 || '#fcd34d' }}>
-                  {formatTime(currentTime)}
-                </span>
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(1, duration || currentTrack?.duration || 1)}
-                  step={0.05}
-                  value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
-                  onChange={(e) => handleSeek(parseFloat(e.target.value))}
-                  aria-label="Seek timeline"
-                  style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
-                  className="flex-1 h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer"
-                />
+                <WithClock step={1}>
+                  {(currentTime) => (
+                    <span className="text-[11px] font-mono w-9 text-right shrink-0" style={{ color: activePalette?.hex300 || '#fcd34d' }}>
+                      {formatTime(currentTime)}
+                    </span>
+                  )}
+                </WithClock>
+                <WithClock>
+                  {(currentTime) => (
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(1, duration || currentTrack?.duration || 1)}
+                      step={0.05}
+                      value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
+                      onChange={(e) => handleSeek(parseFloat(e.target.value))}
+                      aria-label="Seek timeline"
+                      style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
+                      className="flex-1 h-1.5 bg-white/15 rounded-lg appearance-none cursor-pointer"
+                    />
+                  )}
+                </WithClock>
                 <span className="text-[11px] font-mono text-zinc-400 w-9 shrink-0">
                   {formatTime(duration || currentTrack?.duration || 0)}
                 </span>
@@ -5600,95 +5842,92 @@ export default function App() {
           {activeTab === 'library' && (
             <div className="aurelia-glass-panel flex-1 min-h-0 rounded-3xl bg-zinc-900/55 border border-white/10 backdrop-blur-2xl p-4 sm:p-5 shadow-2xl flex flex-col gap-3 overflow-hidden">
               {/* Folder & Library Management Bar */}
-              {(rememberedFolder.name || tracks.length > 0 || importProgress) && (
-                <div className="px-3 py-2 rounded-2xl bg-zinc-950/70 border border-white/[0.07] flex flex-col gap-2 shrink-0">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <FolderOpen className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                      <span className="text-xs font-medium text-zinc-200 truncate">
-                        {rememberedFolder.name || t('library')}
-                      </span>
-                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-zinc-400">
-                        {groupedAlbums.length} albums • {tracks.length} tracks
-                      </span>
-                    </div>
-
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <button
-                        onClick={handleSelectOrRestoreFolder}
-                        className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-200 text-xs flex items-center gap-1.5 transition"
-                        title={t('rescanFolder')}
-                      >
-                        <RefreshCw className="w-3 h-3 text-amber-400" />
-                        <span>{t('rescan')}</span>
-                      </button>
-                      <button
-                        onClick={handleFindAndRemoveDuplicates}
-                        className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-1.5 transition"
-                        title={t('removeDuplicates')}
-                      >
-                        <Sparkles className="w-3 h-3 text-amber-400" />
-                        <span>{t('cleanDuplicates')}</span>
-                      </button>
-                      <button
-                        onClick={handleRunSmartMetadataAudit}
-                        className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 text-xs flex items-center gap-1.5 transition"
-                        title={t('auditMetadata')}
-                      >
-                        <Shield className="w-3 h-3 text-sky-400" />
-                        <span>{t('smartScan')}</span>
-                      </button>
-                      <button
-                        onClick={handleSelectOrRestoreFolder}
-                        className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-zinc-400 hover:text-zinc-200"
-                        title={t('selectMusicFolder')}
-                      >
-                        {t('change')}
-                      </button>
-                      {rememberedFolder.name && (
-                        <button
-                          onClick={handleForgetRememberedFolder}
-                          className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-rose-400/80 hover:text-rose-300"
-                          title={t('forget')}
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
-                      )}
-                    </div>
+              <div className="px-3 py-2 rounded-2xl bg-zinc-950/70 border border-white/[0.07] flex flex-col gap-2 shrink-0">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <FolderOpen className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span className="text-xs font-medium text-zinc-200 truncate">
+                      {rememberedFolder.name || t('library')}
+                    </span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-zinc-400">
+                      {groupedAlbums.length} albums • {tracks.length} tracks
+                    </span>
                   </div>
 
-                  {importProgress && (
-                    <div className="flex flex-col gap-1">
-                      <div className="flex items-center justify-between text-[11px]">
-                        <span className="text-amber-300 flex items-center gap-1.5 truncate">
-                          {importProgress.active && <RefreshCw className="w-3 h-3 animate-spin shrink-0" />}
-                          <span className="truncate">
-                            {importProgress.active
-                              ? `${importProgress.processed}/${importProgress.totalDiscovered} • ${importProgress.currentFile}`
-                              : `Imported ${importProgress.imported} tracks`}
-                          </span>
-                        </span>
-                        <button
-                          onClick={() => setImportProgress(null)}
-                          className="text-zinc-500 hover:text-white text-[10px] shrink-0 ml-2"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                      <div className="w-full h-1 rounded-full bg-white/10 overflow-hidden">
-                        <div
-                          style={{
-                            width: `${Math.round(
-                              (importProgress.processed / Math.max(1, importProgress.totalDiscovered)) * 100
-                            )}%`
-                          }}
-                          className="h-full bg-amber-400 transition-all duration-200"
-                        />
-                      </div>
-                    </div>
-                  )}
+                  <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                    <button
+                      onClick={handlePickAndImportFolder}
+                      className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-xs flex items-center gap-1.5 transition shadow-sm"
+                      title={t('importFolder')}
+                    >
+                      <FolderOpen className="w-3.5 h-3.5" />
+                      <span>{t('importFolder')}</span>
+                    </button>
+                    <button
+                      onClick={handleRescanFolder}
+                      className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-200 text-xs flex items-center gap-1.5 transition"
+                      title={t('rescanFolder')}
+                    >
+                      <RefreshCw className="w-3 h-3 text-amber-400" />
+                      <span>{t('rescan')}</span>
+                    </button>
+                    <button
+                      onClick={handleFindAndRemoveDuplicates}
+                      className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-1.5 transition"
+                      title={t('removeDuplicates')}
+                    >
+                      <Sparkles className="w-3 h-3 text-amber-400" />
+                      <span>{t('cleanDuplicates')}</span>
+                    </button>
+                    <button
+                      onClick={handleRunSmartMetadataAudit}
+                      className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 text-xs flex items-center gap-1.5 transition"
+                      title={t('auditMetadata')}
+                    >
+                      <Shield className="w-3 h-3 text-sky-400" />
+                      <span>{t('smartScan')}</span>
+                    </button>
+                    {rememberedFolder.name && (
+                      <button
+                        onClick={handleForgetRememberedFolder}
+                        className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-rose-400/80 hover:text-rose-300"
+                        title={t('forget')}
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
                 </div>
-              )}
+
+                {importProgress && importProgress.active && (
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-amber-300 flex items-center gap-1.5 truncate">
+                        <RefreshCw className="w-3 h-3 animate-spin shrink-0" />
+                        <span className="truncate">
+                          {importProgress.processed}/{importProgress.totalDiscovered} • {importProgress.currentFile}
+                        </span>
+                      </span>
+                      <button
+                        onClick={() => setImportProgress(null)}
+                        className="text-zinc-500 hover:text-white text-[10px] shrink-0 ml-2"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <div className="w-full h-1 rounded-full bg-white/10 overflow-hidden">
+                      <div
+                        style={{
+                          width: `${Math.round(
+                            (importProgress.processed / Math.max(1, importProgress.totalDiscovered)) * 100
+                          )}%`
+                        }}
+                        className="h-full bg-amber-400 transition-all duration-200"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
 
               {/* Library Controls Header */}
               <div className="flex flex-wrap items-center justify-between gap-2.5 shrink-0">
@@ -5828,11 +6067,11 @@ export default function App() {
                         <span>Import Music</span>
                       </button>
                       <button
-                        onClick={() => handleSelectOrRestoreFolder(null)}
+                        onClick={handlePickAndImportFolder}
                         className="px-3.5 py-1.5 rounded-xl bg-white/10 text-zinc-200 font-medium text-xs hover:bg-white/15 transition flex items-center gap-1.5"
                       >
                         <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
-                        <span>Select Folder</span>
+                        <span>{t('importFolder')}</span>
                       </button>
                     </div>
                   </div>
@@ -6289,25 +6528,26 @@ export default function App() {
                           className="h-16 w-full flex items-center gap-[2px] cursor-pointer py-1"
                           title="Click to seek"
                         >
-                          {currentTrack.dspAnalysis.waveformPeaks.map((pk, idx) => {
-                            const total = currentTrack.dspAnalysis.waveformPeaks.length;
-                            const progressRatio = (currentTime || 0) / Math.max(1, duration || 1);
-                            const passed = idx / total <= progressRatio;
-                            const hPct = Math.max(8, Math.round(pk * 100));
-                            return (
-                              <div key={idx} className="flex-1 h-full flex items-center justify-center">
-                                <div
-                                  style={{
-                                    height: `${hPct}%`,
-                                    backgroundColor: passed ? (activePalette?.hex400 || '#fbbf24') : undefined
-                                  }}
-                                  className={`w-full rounded-full transition-colors ${
-                                    passed ? '' : 'bg-white/15 hover:bg-white/35'
-                                  }`}
-                                />
-                              </div>
-                            );
-                          })}
+                          <WithClock>
+                            {(currentTime) => currentTrack.dspAnalysis.waveformPeaks.map((pk, idx) => {
+                              const total = currentTrack.dspAnalysis.waveformPeaks.length;
+                              const progressRatio = (currentTime || 0) / Math.max(1, duration || 1);
+                              const passed = idx / total <= progressRatio;
+                              const hPct = Math.max(8, Math.round(pk * 100));
+                              return (
+                                <div key={idx} className="flex-1 h-full flex items-center justify-center">
+                                  <div
+                                    style={{
+                                      height: `${hPct}%`,
+                                      backgroundColor: passed ? (activePalette?.hex400 || '#fbbf24') : undefined
+                                    }}
+                                    className={`w-full rounded-full transition-colors ${passed ? '' : 'bg-white/15 hover:bg-white/35'
+                                      }`}
+                                  />
+                                </div>
+                              );
+                            })}
+                          </WithClock>
                         </div>
                       </div>
                     )}
@@ -6596,22 +6836,20 @@ export default function App() {
                       <div className="flex items-center gap-1 bg-zinc-950/80 p-1 rounded-xl border border-white/10">
                         <button
                           onClick={() => updateSetting('themeMode', 'dark')}
-                          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition ${
-                            settings.themeMode !== 'light'
-                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                              : 'text-zinc-400 hover:text-white'
-                          }`}
+                          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition ${settings.themeMode !== 'light'
+                            ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                            : 'text-zinc-400 hover:text-white'
+                            }`}
                         >
                           <Moon className="w-3.5 h-3.5" />
                           <span>{t('darkMode')}</span>
                         </button>
                         <button
                           onClick={() => updateSetting('themeMode', 'light')}
-                          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition ${
-                            settings.themeMode === 'light'
-                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                              : 'text-zinc-400 hover:text-white'
-                          }`}
+                          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition ${settings.themeMode === 'light'
+                            ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                            : 'text-zinc-400 hover:text-white'
+                            }`}
                         >
                           <Sun className="w-3.5 h-3.5" />
                           <span>{t('lightMode')}</span>
@@ -6628,21 +6866,19 @@ export default function App() {
                       <div className="flex items-center gap-1 bg-zinc-950/80 p-1 rounded-xl border border-white/10">
                         <button
                           onClick={() => updateSetting('language', 'vi')}
-                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${
-                            settings.language === 'vi'
-                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                              : 'text-zinc-400 hover:text-white'
-                          }`}
+                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${settings.language === 'vi'
+                            ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                            : 'text-zinc-400 hover:text-white'
+                            }`}
                         >
                           Tiếng Việt
                         </button>
                         <button
                           onClick={() => updateSetting('language', 'en')}
-                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${
-                            settings.language === 'en'
-                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                              : 'text-zinc-400 hover:text-white'
-                          }`}
+                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${settings.language === 'en'
+                            ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                            : 'text-zinc-400 hover:text-white'
+                            }`}
                         >
                           English
                         </button>
@@ -6692,11 +6928,10 @@ export default function App() {
                           <button
                             key={pal.id}
                             onClick={() => updateSetting('accentColor', pal.id)}
-                            className={`flex flex-col items-center gap-2 p-3 rounded-xl border text-center transition group relative overflow-hidden ${
-                              isSelected
-                                ? 'bg-amber-500/15 border-amber-400/60 shadow-lg shadow-amber-500/15 ring-1 ring-amber-400/30'
-                                : 'bg-zinc-900/50 border-white/[0.06] hover:bg-white/5 hover:border-white/15'
-                            }`}
+                            className={`flex flex-col items-center gap-2 p-3 rounded-xl border text-center transition group relative overflow-hidden ${isSelected
+                              ? 'bg-amber-500/15 border-amber-400/60 shadow-lg shadow-amber-500/15 ring-1 ring-amber-400/30'
+                              : 'bg-zinc-900/50 border-white/[0.06] hover:bg-white/5 hover:border-white/15'
+                              }`}
                           >
                             <span
                               className="w-6 h-6 rounded-full shrink-0 ring-2 ring-white/30 shadow-md transition-transform group-hover:scale-110 flex items-center justify-center"
@@ -6801,11 +7036,10 @@ export default function App() {
                               showToast('Hex invalid (e.g. #3B82F6)', 'error');
                             }
                           }}
-                          className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition ${
-                            settings.accentColor === 'custom'
-                              ? 'bg-amber-500 hover:bg-amber-400 text-zinc-950 shadow-md shadow-amber-500/20'
-                              : 'bg-white/10 hover:bg-white/15 text-zinc-200'
-                          }`}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition ${settings.accentColor === 'custom'
+                            ? 'bg-amber-500 hover:bg-amber-400 text-zinc-950 shadow-md shadow-amber-500/20'
+                            : 'bg-white/10 hover:bg-white/15 text-zinc-200'
+                            }`}
                         >
                           {t('apply')}
                         </button>
@@ -6848,7 +7082,7 @@ export default function App() {
                     <span className="text-xs text-zinc-300">{t('musicFolder')}</span>
                     <div className="flex items-center gap-1.5">
                       <button
-                        onClick={handleSelectOrRestoreFolder}
+                        onClick={handleRescanFolder}
                         className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-300 text-xs flex items-center gap-1"
                         title={t('rescanFolder')}
                       >
@@ -6856,7 +7090,7 @@ export default function App() {
                         <span>{t('rescan')}</span>
                       </button>
                       <button
-                        onClick={handleSelectOrRestoreFolder}
+                        onClick={handlePickAndImportFolder}
                         className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-xs"
                       >
                         {rememberedFolder.name ? t('change') : t('select')}
@@ -6875,7 +7109,7 @@ export default function App() {
                   <div className="flex items-center justify-between py-1">
                     <div className="flex flex-col">
                       <span className="text-xs text-zinc-300">{t('removeDuplicates')}</span>
-                      <span className="text-[11px] text-zinc-500">Tự động phát hiện và dọn bản sao trùng lặp</span>
+
                     </div>
                     <button
                       onClick={handleFindAndRemoveDuplicates}
@@ -6889,7 +7123,7 @@ export default function App() {
                   <div className="flex items-center justify-between py-1">
                     <div className="flex flex-col">
                       <span className="text-xs text-zinc-300">{t('auditMetadata')}</span>
-                      <span className="text-[11px] text-zinc-500">Phát hiện và tự động chuẩn hóa metadata, ảnh bìa, năm phát hành</span>
+
                     </div>
                     <button
                       onClick={handleRunSmartMetadataAudit}
@@ -6903,6 +7137,7 @@ export default function App() {
                   {[
                     ['gapless', t('gaplessPlayback')],
                     ['rememberMusicFolder', t('rememberMusicFolder')],
+                    ['closeToTray', t('closeToTray')],
                     ['autoOnlineMetadata', t('autoOnlineMetadata')],
                     ['autoOnlineArtwork', t('autoOnlineArtwork')],
                     ['autoOnlineLyrics', t('autoOnlineLyrics')],
@@ -6970,6 +7205,8 @@ export default function App() {
                     <div className="grid grid-cols-2 gap-1.5 text-xs">
                       {[
                         ['Space', 'Play / Pause'],
+                        ['1 - 4', 'EQ Profiles'],
+                        ['E', 'EQ Bypass'],
                         ['← / →', 'Seek 5s'],
                         ['↑ / ↓', 'Volume'],
                         ['M', 'Mute'],
@@ -7197,21 +7434,30 @@ export default function App() {
               ref={fullscreenVisualizerCanvasRef}
               width={640}
               height={56}
+              style={{ transform: 'translateZ(0)', willChange: 'contents' }}
               className="w-full h-[56px] block pointer-events-none"
             />
 
             <div className="flex items-center gap-3">
-              <span className="text-xs font-mono w-10 text-right" style={{ color: activePalette?.hex300 || '#fcd34d' }}>{formatTime(currentTime)}</span>
-              <input
-                type="range"
-                min={0}
-                max={Math.max(1, duration || currentTrack?.duration || 1)}
-                step={0.05}
-                value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
-                onChange={(e) => handleSeek(parseFloat(e.target.value))}
-                style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
-                className="flex-1 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer"
-              />
+              <WithClock step={1}>
+                {(currentTime) => (
+                  <span className="text-xs font-mono w-10 text-right" style={{ color: activePalette?.hex300 || '#fcd34d' }}>{formatTime(currentTime)}</span>
+                )}
+              </WithClock>
+              <WithClock>
+                {(currentTime) => (
+                  <input
+                    type="range"
+                    min={0}
+                    max={Math.max(1, duration || currentTrack?.duration || 1)}
+                    step={0.05}
+                    value={Math.min(currentTime, duration || currentTrack?.duration || 1)}
+                    onChange={(e) => handleSeek(parseFloat(e.target.value))}
+                    style={{ accentColor: activePalette?.hex400 || '#fbbf24' }}
+                    className="flex-1 h-1.5 bg-white/20 rounded-lg appearance-none cursor-pointer"
+                  />
+                )}
+              </WithClock>
               <span className="text-xs font-mono text-zinc-400 w-10">
                 {formatTime(duration || currentTrack?.duration || 0)}
               </span>
@@ -7393,26 +7639,24 @@ export default function App() {
                       : `Phát hiện ${smartAuditResult.totalDiscrepancies} điểm bất thường trong ${smartAuditResult.albumIssues.length} album`}
                   </span>
                   <span
-                    className={`font-bold font-mono text-sm ${
-                      smartAuditResult.healthScore === 100
-                        ? 'text-emerald-400'
-                        : smartAuditResult.healthScore >= 75
+                    className={`font-bold font-mono text-sm ${smartAuditResult.healthScore === 100
+                      ? 'text-emerald-400'
+                      : smartAuditResult.healthScore >= 75
                         ? 'text-amber-400'
                         : 'text-rose-400'
-                    }`}
+                      }`}
                   >
                     {smartAuditResult.healthScore}%
                   </span>
                 </div>
                 <div className="w-full h-2 rounded-full bg-black/40 overflow-hidden ring-1 ring-white/10">
                   <div
-                    className={`h-full rounded-full transition-all duration-500 ${
-                      smartAuditResult.healthScore === 100
-                        ? 'bg-gradient-to-r from-emerald-500 to-teal-400'
-                        : smartAuditResult.healthScore >= 75
+                    className={`h-full rounded-full transition-all duration-500 ${smartAuditResult.healthScore === 100
+                      ? 'bg-gradient-to-r from-emerald-500 to-teal-400'
+                      : smartAuditResult.healthScore >= 75
                         ? 'bg-gradient-to-r from-amber-500 to-orange-400'
                         : 'bg-gradient-to-r from-rose-500 to-pink-500'
-                    }`}
+                      }`}
                     style={{ width: `${smartAuditResult.healthScore}%` }}
                   />
                 </div>
@@ -7489,32 +7733,6 @@ export default function App() {
             </div>
           </div>
         </div>
-      )}
-
-      {/* Desktop Companion (Mini Player) Overlay */}
-      {isMiniPlayer && (
-        <MiniPlayerOverlay
-          currentTrack={currentTrack}
-          isPlaying={isPlaying}
-          currentTime={currentTime}
-          duration={duration}
-          volume={volume}
-          isMuted={isMuted}
-          onTogglePlayPause={togglePlayPause}
-          onPrevTrack={handlePrevTrack}
-          onNextTrack={() => handleNextTrack(false)}
-          onSeek={handleSeek}
-          onToggleMute={() => setIsMuted((m) => !m)}
-          onVolumeChange={(val) => {
-            setIsMuted(false);
-            setVolume(val);
-          }}
-          alwaysOnTop={alwaysOnTop}
-          onToggleAlwaysOnTop={handleToggleAlwaysOnTop}
-          onExitMiniPlayer={handleExitMiniPlayer}
-          onHideToTray={handleHideToTray}
-          formatTime={formatTime}
-        />
       )}
     </div>
   );

@@ -10,7 +10,7 @@ import {
     validateImportedPresetJson
 } from '../peqEngine';
 
-export default function PeqPanel({
+function PeqPanel({
     peqState,
     onChangePeqState,
     customPresets,
@@ -514,3 +514,5 @@ export default function PeqPanel({
         </div>
     );
 }
+
+export default React.memo(PeqPanel);

@@ -183,8 +183,18 @@ export function applyAppearanceTokens(themeMode = 'dark', accentId = 'amber', cu
 
     root.setAttribute('data-theme', mode);
     root.setAttribute('data-accent', pal.id);
+    if (mode === 'dark') {
+        root.classList.add('dark');
+    } else {
+        root.classList.remove('dark');
+    }
     if (document.body) {
         document.body.setAttribute('data-theme', mode);
+        if (mode === 'dark') {
+            document.body.classList.add('dark');
+        } else {
+            document.body.classList.remove('dark');
+        }
     }
 
     root.style.setProperty('--accent-200', pal.rgb200);

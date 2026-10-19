@@ -17,8 +17,8 @@
         "title": "Aurelia Audio",
         "width": 1280,
         "height": 820,
-        "minWidth": 360,
-        "minHeight": 150,
+        "minWidth": 480,
+        "minHeight": 320,
         "resizable": true,
         "fullscreen": false,
         "decorations": false

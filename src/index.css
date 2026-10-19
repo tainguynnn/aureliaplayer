@@ -21,36 +21,35 @@
    Master Frosted Glass System (Glassmorphic Audio Console)
    ========================================================================== */
 .aurelia-glass-header {
-  background-color: rgba(9, 11, 18, 0.62) !important;
-  backdrop-filter: blur(28px) saturate(190%) !important;
-  -webkit-backdrop-filter: blur(28px) saturate(190%) !important;
+  background-color: rgba(9, 11, 18, 0.82) !important;
+  backdrop-filter: blur(12px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(160%) !important;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
   box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.35) !important;
+  transform: translateZ(0);
 }
 
 .aurelia-glass-panel {
-  background-color: rgba(15, 18, 28, 0.58) !important;
-  backdrop-filter: blur(34px) saturate(190%) !important;
-  -webkit-backdrop-filter: blur(34px) saturate(190%) !important;
+  background-color: rgba(15, 18, 28, 0.82) !important;
+  backdrop-filter: blur(12px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(160%) !important;
   border: 1px solid rgba(255, 255, 255, 0.12) !important;
   box-shadow: 0 30px 60px -12px rgba(0, 0, 0, 0.7), inset 0 1px 1px 0 rgba(255, 255, 255, 0.18), inset 0 0 0 1px rgba(255, 255, 255, 0.04) !important;
+  transform: translateZ(0);
 }
 
 .aurelia-player-centerpiece {
-  background-color: rgba(11, 14, 23, 0.64) !important;
-  backdrop-filter: blur(36px) saturate(190%) !important;
-  -webkit-backdrop-filter: blur(36px) saturate(190%) !important;
+  background-color: rgba(11, 14, 23, 0.86) !important;
+  backdrop-filter: blur(12px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(160%) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   box-shadow: 0 30px 60px -12px rgba(0, 0, 0, 0.75), inset 0 1px 1px 0 rgba(255, 255, 255, 0.2) !important;
+  transform: translateZ(0);
 }
 
 /* ==========================================================================
    Light Mode Master Audio Studio Theme (High Contrast & Frosted Glass)
    ========================================================================== */
-html[data-theme="light"] {
-  color-scheme: light;
-}
-
 html[data-theme="light"],
 html[data-theme="light"] body {
   background-color: #e2e8f0;
@@ -113,9 +112,7 @@ html[data-theme="light"] .bg-zinc-950\/75,
 html[data-theme="light"] .bg-zinc-950\/70,
 html[data-theme="light"] .bg-zinc-950\/65,
 html[data-theme="light"] .bg-zinc-950\/60 {
-  background-color: rgba(255, 255, 255, 0.94) !important;
-  backdrop-filter: blur(16px) saturate(180%) !important;
-  -webkit-backdrop-filter: blur(16px) saturate(180%) !important;
+  background-color: rgba(255, 255, 255, 0.96) !important;
   border: 1px solid rgba(15, 23, 42, 0.13) !important;
   box-shadow: 0 4px 16px -2px rgba(15, 23, 42, 0.07), inset 0 1px 0 rgba(255, 255, 255, 1) !important;
 }
@@ -414,4 +411,64 @@ html[data-theme="light"] .aurelia-fullscreen-player .aurelia-fs-btn:hover,
 html[data-theme="light"] .aurelia-fullscreen-lyrics .aurelia-fs-btn:hover {
   background-color: rgba(15, 23, 42, 0.14) !important;
   color: #090d16 !important;
+}
+
+
+/* ==========================================================================
+   Static Scrollbar System & Title Bar Animations
+   ========================================================================== */
+.aurelia-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(245, 158, 11, 0.28) rgba(255, 255, 255, 0.02);
+}
+.aurelia-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.aurelia-scrollbar::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 9999px;
+}
+.aurelia-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.aurelia-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 158, 11, 0.55);
+}
+.aurelia-scrollbar::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Hide every visible scrollbar without disabling scrolling */
+html,
+body,
+#root,
+* {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+*::-webkit-scrollbar,
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-thumb,
+*::-webkit-scrollbar-corner {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  background: transparent !important;
+}
+
+/* Title bar & Mini Player equalizer bars animation */
+@keyframes aurelia-eq {
+  0%, 100% { transform: scaleY(0.22); }
+  50% { transform: scaleY(1); }
 }
