@@ -90,6 +90,19 @@ fn read_file_header(path: String, max_bytes: usize) -> Result<Vec<u8>, String> {
     Ok(buffer)
 }
 
+#[tauri::command]
+fn verify_folder_access(folder_path: String) -> bool {
+    let p = Path::new(&folder_path);
+    p.exists() && p.is_dir()
+}
+
+#[tauri::command]
+fn open_devtools(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.open_devtools();
+    }
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static CLOSE_TO_TRAY: AtomicBool = AtomicBool::new(true);
@@ -136,6 +149,13 @@ fn update_tray_track(app: tauri::AppHandle, title: Option<String>, artist: Optio
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -222,6 +242,8 @@ pub fn run() {
             pick_music_folder,
             scan_music_folder,
             read_file_header,
+            verify_folder_access,
+            open_devtools,
             set_close_to_tray,
             close_aurelia_window,
             update_tray_track

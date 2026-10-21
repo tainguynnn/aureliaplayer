@@ -12,6 +12,11 @@ import {
 } from './peqEngine';
 import PeqPanel from './components/PeqPanel';
 import {
+  verifyFolderAccess,
+  sanitizeTrackForStorage,
+  reclaimAudioBlobStorage
+} from './storageManager';
+import {
   Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Volume1,
   Repeat, Repeat1, Shuffle, Music, Disc, FolderOpen, Upload,
   Search, Activity, Settings,
@@ -19,7 +24,7 @@ import {
   RefreshCw, ListMusic, HardDrive,
   Shield, Zap, BarChart2, CheckCircle2,
   ArrowUpDown, SlidersHorizontal, Heart, LayoutGrid, List, ChevronUp, ChevronDown,
-  AlignCenter, Globe, ExternalLink, EyeOff, Sun, Moon, Palette, Check
+  AlignCenter, Globe, ExternalLink, EyeOff, Sun, Moon, Palette, Check, Headphones
 } from 'lucide-react';
 
 const SUPPORTED_CODECS = [
@@ -45,7 +50,7 @@ function isDesktopShell() {
   if (typeof window === 'undefined') return false;
   return Boolean(
     window.aureliaWindow ||
-    window.__TAURI__ |
+    window.__TAURI__ ||
     window.__TAURI_INTERNALS__ ||
     window.pywebview ||
     /Electron\//.test(navigator.userAgent || '')
@@ -128,7 +133,23 @@ function openAureliaDB() {
       reject(new Error('IndexedDB is unavailable in this browser environment.'));
       return;
     }
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('IndexedDB open timed out after 3000ms'));
+      }
+    }, 3000);
+
     const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onblocked = () => {
+      console.warn('IndexedDB open blocked by existing open connection');
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error('IndexedDB open blocked'));
+      }
+    };
     request.onupgradeneeded = (event) => {
       const db = event.target.result;
       if (!db.objectStoreNames.contains('tracks')) {
@@ -153,8 +174,20 @@ function openAureliaDB() {
         db.createObjectStore('handles', { keyPath: 'key' });
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB'));
+    request.onsuccess = () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(request.result);
+      }
+    };
+    request.onerror = () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(request.error || new Error('Failed to open IndexedDB'));
+      }
+    };
   });
 }
 
@@ -1931,7 +1964,8 @@ export default function App() {
     name: null,
     path: null,
     mode: null, // 'fs-handle' | 'idb-fallback' | 'tauri-native'
-    permissionState: 'unknown', // 'granted' | 'prompt' | 'denied' | 'sandbox-fallback'
+    permissionState: 'unknown', // 'granted' | 'prompt' | 'denied' | 'sandbox-fallback' | 'unavailable'
+    isAvailable: true,
     trackCount: 0,
     lastScannedAt: null
   });
@@ -1950,7 +1984,7 @@ export default function App() {
   const [settings, setSettings] = useState({
     visualizerSmoothing: 0.8,
     ambientGlow: true,
-    persistBlobsInIdb: true,
+    persistBlobsInIdb: false,
     rememberMusicFolder: true,
     closeToTray: true,
     autoOnlineArtwork: true,
@@ -1963,7 +1997,10 @@ export default function App() {
     accentColor: 'amber',
     customAccentHex: '#f59e0b',
     language: 'vi', // 'vi' | 'en'
-    autoAlbumTheme: false
+    autoAlbumTheme: false,
+    channelBalance: 0, // -100 (Full Left) to 100 (Full Right), 0 is Center
+    leftChannelVolume: 1.0, // 0.0 to 1.0
+    rightChannelVolume: 1.0 // 0.0 to 1.0
   });
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -2048,6 +2085,8 @@ export default function App() {
   const analyserRef = useRef(null);
   const sourceNodeRef = useRef(null);
   const connectedMediaElementsRef = useRef(new WeakSet());
+  const leftGainRef = useRef(null);
+  const rightGainRef = useRef(null);
   const eqLowRef = useRef(null);
   const eqMidRef = useRef(null);
   const eqHighRef = useRef(null);
@@ -2407,14 +2446,28 @@ export default function App() {
       }
       peqLoadedRef.current = true;
 
-      // Restore remembered music folder record natively without localhost permission prompts
+      // Restore and verify remembered music folder record
       if (savedFolderRecord) {
+        let isPermGranted = true;
+        let permState = 'granted';
+        try {
+          const access = await verifyFolderAccess(savedFolderRecord);
+          isPermGranted = access.ok;
+          permState = access.ok
+            ? 'granted'
+            : (access.needsPrompt ? 'prompt' : 'unavailable');
+        } catch {
+          isPermGranted = false;
+          permState = 'unavailable';
+        }
+
         setRememberedFolder({
-          handle: null,
+          handle: savedFolderRecord.handle || null,
           name: savedFolderRecord.name || 'Local Music Folder',
           path: savedFolderRecord.path || null,
-          mode: savedFolderRecord.mode || 'tauri-native',
-          permissionState: 'granted',
+          mode: savedFolderRecord.mode || (savedFolderRecord.path ? 'tauri-native' : 'fs-handle'),
+          permissionState: permState,
+          isAvailable: isPermGranted,
           trackCount: savedFolderRecord.trackCount || 0,
           lastScannedAt: savedFolderRecord.lastScannedAt || null
         });
@@ -2495,11 +2548,7 @@ export default function App() {
                 coverProvenance: match.provenance,
                 isArtworkVerified: true
               };
-              dbPut('tracks', {
-                ...updated,
-                objectUrl: null,
-                audioBlob: settings.persistBlobsInIdb ? updated.audioBlob : null
-              });
+              dbPut('tracks', sanitizeTrackForStorage(updated, settings.persistBlobsInIdb));
               return updated;
             })
           );
@@ -2580,11 +2629,7 @@ export default function App() {
                 lyrics: resolved.lyrics,
                 lyricsSource: resolved.lyricsSource
               };
-              dbPut('tracks', {
-                ...updated,
-                objectUrl: null,
-                audioBlob: settings.persistBlobsInIdb ? updated.audioBlob : null
-              });
+              dbPut('tracks', sanitizeTrackForStorage(updated, settings.persistBlobsInIdb));
               return updated;
             })
           );
@@ -2729,11 +2774,7 @@ export default function App() {
 
             updated.fieldSources = nextSources;
 
-            dbPut('tracks', {
-              ...updated,
-              objectUrl: null,
-              audioBlob: settings.persistBlobsInIdb ? updated.audioBlob : null
-            });
+            dbPut('tracks', sanitizeTrackForStorage(updated, settings.persistBlobsInIdb));
             return updated;
           })
         );
@@ -2878,19 +2919,98 @@ export default function App() {
         filterNodes[i].connect(filterNodes[i + 1]);
       }
       filterNodes[filterNodes.length - 1].connect(analyser);
-      analyser.connect(ctx.destination);
+
+      // Dual-channel stereo balance & headphone imbalance calibration
+      const stereoGain = ctx.createGain();
+      stereoGain.channelCount = 2;
+      stereoGain.channelCountMode = 'explicit';
+      stereoGain.channelInterpretation = 'speakers';
+
+      const splitter = ctx.createChannelSplitter(2);
+      const merger = ctx.createChannelMerger(2);
+      const leftGain = ctx.createGain();
+      const rightGain = ctx.createGain();
+
+      const curBal = settingsRef.current.channelBalance ?? 0;
+      const curL = settingsRef.current.leftChannelVolume ?? 1.0;
+      const curR = settingsRef.current.rightChannelVolume ?? 1.0;
+      const effL = Math.max(0, curL * (curBal > 0 ? (100 - curBal) / 100 : 1));
+      const effR = Math.max(0, curR * (curBal < 0 ? (100 + curBal) / 100 : 1));
+      leftGain.gain.value = effL;
+      rightGain.gain.value = effR;
+
+      analyser.connect(stereoGain);
+      stereoGain.connect(splitter);
+
+      splitter.connect(leftGain, 0);
+      leftGain.connect(merger, 0, 0);
+
+      splitter.connect(rightGain, 1);
+      rightGain.connect(merger, 0, 1);
+
+      merger.connect(ctx.destination);
 
       audioCtxRef.current = ctx;
       analyserRef.current = analyser;
       sourceNodeRef.current = firstSource;
       preampGainRef.current = preampGain;
       filterNodesRef.current = filterNodes;
+      leftGainRef.current = leftGain;
+      rightGainRef.current = rightGain;
 
       applyPeqToAudioNodes(ctx, preampGain, filterNodes, peqStateRef.current || peqState);
     } catch (err) {
       console.warn('Web Audio graph setup notice:', err);
     }
   }, [settings.visualizerSmoothing, peqState]);
+
+  // Synchronize Stereo Balance and Dual-Channel Volume into Web Audio Graph
+  useEffect(() => {
+    if (audioCtxRef.current && leftGainRef.current && rightGainRef.current) {
+      const bal = settings.channelBalance ?? 0;
+      const lVol = settings.leftChannelVolume ?? 1.0;
+      const rVol = settings.rightChannelVolume ?? 1.0;
+      const effL = Math.max(0, lVol * (bal > 0 ? (100 - bal) / 100 : 1));
+      const effR = Math.max(0, rVol * (bal < 0 ? (100 + bal) / 100 : 1));
+      const now = audioCtxRef.current.currentTime;
+      leftGainRef.current.gain.setTargetAtTime(effL, now, 0.015);
+      rightGainRef.current.gain.setTargetAtTime(effR, now, 0.015);
+    }
+  }, [settings.channelBalance, settings.leftChannelVolume, settings.rightChannelVolume]);
+
+  // Diagnostic Test Tone for Left / Right Channel Verification
+  const playChannelTestTone = useCallback((channel) => {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = audioCtxRef.current || new AudioCtx();
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      const osc = ctx.createOscillator();
+      const toneGain = ctx.createGain();
+      const panner = typeof ctx.createStereoPanner === 'function' ? ctx.createStereoPanner() : null;
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(channel === 'left' ? 440 : 554.37, ctx.currentTime);
+
+      if (panner) {
+        panner.pan.setValueAtTime(channel === 'left' ? -1 : 1, ctx.currentTime);
+        osc.connect(toneGain);
+        toneGain.connect(panner);
+        panner.connect(ctx.destination);
+      } else {
+        osc.connect(toneGain);
+        toneGain.connect(ctx.destination);
+      }
+
+      const now = ctx.currentTime;
+      toneGain.gain.setValueAtTime(0, now);
+      toneGain.gain.linearRampToValueAtTime(0.18, now + 0.04);
+      toneGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
+      osc.start(now);
+      osc.stop(now + 0.42);
+    } catch (e) {
+      console.warn('Channel test tone warning:', e);
+    }
+  }, []);
 
   // Unloads a deck that is no longer the active one
   const finalizeDeck = useCallback((idx) => {
@@ -3487,11 +3607,24 @@ export default function App() {
 
   const runTrackDspAnalysis = useCallback(
     async (trackToAnalyze) => {
-      if (!trackToAnalyze || !trackToAnalyze.audioBlob) return;
+      if (!trackToAnalyze || (!trackToAnalyze.audioBlob && !trackToAnalyze.objectUrl)) return;
       setIsAnalyzingDsp(true);
       setDspError(null);
       try {
-        const dsp = await performOfflineSignalAnalysis(trackToAnalyze.audioBlob, trackToAnalyze);
+        let blob = trackToAnalyze.audioBlob;
+        if (!(blob instanceof Blob) && trackToAnalyze.objectUrl) {
+          try {
+            const resp = await fetch(trackToAnalyze.objectUrl);
+            blob = await resp.blob();
+          } catch (fetchErr) {
+            console.warn('Could not fetch audio stream for offline DSP analysis:', fetchErr);
+          }
+        }
+        if (!blob) {
+          setIsAnalyzingDsp(false);
+          return;
+        }
+        const dsp = await performOfflineSignalAnalysis(blob, trackToAnalyze);
         setTracks((prev) =>
           prev.map((t) => {
             if (t.id !== trackToAnalyze.id) return t;
@@ -3504,11 +3637,7 @@ export default function App() {
               channelsSource: t.channels ? t.channelsSource : dsp.channelsSource,
               dspAnalysis: dsp
             };
-            dbPut('tracks', {
-              ...updated,
-              objectUrl: null,
-              audioBlob: settings.persistBlobsInIdb ? updated.audioBlob : null
-            });
+            dbPut('tracks', sanitizeTrackForStorage(updated, settings.persistBlobsInIdb));
             return updated;
           })
         );
@@ -3522,7 +3651,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (activeTab === 'insights' && currentTrack && !currentTrack.dspAnalysis && currentTrack.audioBlob && !isAnalyzingDsp) {
+    if (activeTab === 'insights' && currentTrack && !currentTrack.dspAnalysis && (currentTrack.audioBlob || currentTrack.objectUrl) && !isAnalyzingDsp) {
       const timer = setTimeout(() => {
         runTrackDspAnalysis(currentTrack);
       }, 350);
@@ -3704,11 +3833,7 @@ export default function App() {
               needsRelink: false
             };
             relinkedMap.set(existingTrack.id, updatedExisting);
-            await dbPut('tracks', {
-              ...updatedExisting,
-              objectUrl: null,
-              audioBlob: file.filePath ? null : (settings.persistBlobsInIdb ? file : null)
-            });
+            await dbPut('tracks', sanitizeTrackForStorage(updatedExisting, settings.persistBlobsInIdb));
             relinkedCount++;
           } else {
             duplicateSkippedCount++;
@@ -3810,11 +3935,7 @@ export default function App() {
             newlyImported.push(trackObj);
             importedCount++;
 
-            await dbPut('tracks', {
-              ...trackObj,
-              objectUrl: null,
-              audioBlob: file.filePath ? null : (settings.persistBlobsInIdb ? file : null)
-            });
+            await dbPut('tracks', sanitizeTrackForStorage(trackObj, settings.persistBlobsInIdb));
           } catch (fileErr) {
             errorCount++;
           }
@@ -4050,29 +4171,81 @@ export default function App() {
       } catch (err) {
         console.warn('Native folder picker fallback:', err);
       }
+    } else if (typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function' && !envStatus.isCrossOriginIframe) {
+      try {
+        const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+        if (dirHandle) {
+          const stats = { folders: 0, errors: 0, skippedNonAudio: 0 };
+          const entries = await traverseDirectoryHandleRecursive(dirHandle, dirHandle.name, stats);
+          const nowIso = new Date().toISOString();
+          if (settings.rememberMusicFolder) {
+            await dbPut('handles', {
+              key: 'musicFolder',
+              handle: dirHandle,
+              name: dirHandle.name,
+              mode: 'fs-handle',
+              trackCount: entries.length,
+              lastScannedAt: nowIso
+            });
+          }
+          setRememberedFolder({
+            handle: dirHandle,
+            name: dirHandle.name,
+            mode: 'fs-handle',
+            permissionState: 'granted',
+            isAvailable: true,
+            trackCount: entries.length,
+            lastScannedAt: nowIso
+          });
+          await processNormalizedImportEntries(entries, dirHandle.name, stats);
+          return;
+        }
+      } catch (err) {
+        if (err?.name === 'AbortError') return;
+      }
     }
-    fileInputRef.current?.click();
-  }, [handleScanAndImportNativeFolder]);
-
-  const handleRescanFolder = useCallback(async () => {
-    if (rememberedFolder?.path) {
-      await handleScanAndImportNativeFolder(rememberedFolder.path);
+    if (folderInputRef.current) {
+      folderInputRef.current.click();
     } else {
-      await handlePickAndImportFolder();
+      fileInputRef.current?.click();
     }
-  }, [rememberedFolder?.path, handleScanAndImportNativeFolder, handlePickAndImportFolder]);
+  }, [handleScanAndImportNativeFolder, envStatus.isCrossOriginIframe, settings.rememberMusicFolder, processNormalizedImportEntries]);
 
   const handleSelectOrRestoreFolder = useCallback(async (forcedArg = null) => {
     if (typeof forcedArg === 'string') {
       await handleScanAndImportNativeFolder(forcedArg);
       return;
     }
+    if (forcedArg && typeof forcedArg.requestPermission === 'function') {
+      try {
+        const perm = await forcedArg.requestPermission({ mode: 'read' });
+        if (perm === 'granted') {
+          const stats = { folders: 0, errors: 0, skippedNonAudio: 0 };
+          const entries = await traverseDirectoryHandleRecursive(forcedArg, forcedArg.name, stats);
+          await processNormalizedImportEntries(entries, forcedArg.name, stats);
+          setRememberedFolder((prev) => ({ ...prev, permissionState: 'granted', isAvailable: true }));
+          return;
+        }
+      } catch (err) {
+        console.warn('Folder handle permission request failed:', err);
+      }
+    }
     if (forcedArg === true && rememberedFolder?.path) {
       await handleScanAndImportNativeFolder(rememberedFolder.path);
       return;
     }
     await handlePickAndImportFolder();
-  }, [handleScanAndImportNativeFolder, handlePickAndImportFolder, rememberedFolder]);
+  }, [handleScanAndImportNativeFolder, handlePickAndImportFolder, rememberedFolder, processNormalizedImportEntries]);
+
+  const handleRescanFolder = useCallback(async () => {
+    if (rememberedFolder?.path) {
+      await handleScanAndImportNativeFolder(rememberedFolder.path);
+    } else if (rememberedFolder?.handle) {
+      await handleSelectOrRestoreFolder(rememberedFolder.handle);
+    } else {
+      await handlePickAndImportFolder();
+    }
+  }, [rememberedFolder?.path, rememberedFolder?.handle, handleScanAndImportNativeFolder, handleSelectOrRestoreFolder, handlePickAndImportFolder]);
 
   const handleForgetRememberedFolder = useCallback(async () => {
     await dbDelete('handles', 'musicFolder');
@@ -4109,7 +4282,7 @@ export default function App() {
     // Quality scoring function to pick the BEST master track to keep
     const scoreTrackQuality = (trk) => {
       let score = 0;
-      if (trk.audioBlob instanceof Blob || (typeof trk.objectUrl === 'string' && trk.objectUrl.startsWith('blob:'))) {
+      if (trk.filePath || trk.audioBlob instanceof Blob || trk.objectUrl) {
         score += 1000;
       }
       const codec = String(trk.codec || '').toUpperCase();
@@ -4580,11 +4753,7 @@ export default function App() {
 
     for (const [, updatedTrk] of trackUpdates) {
       try {
-        await dbPut('tracks', {
-          ...updatedTrk,
-          objectUrl: null,
-          audioBlob: settings.persistBlobsInIdb ? updatedTrk.audioBlob : null
-        });
+        await dbPut('tracks', sanitizeTrackForStorage(updatedTrk, settings.persistBlobsInIdb));
       } catch (err) {
         console.warn('Failed to persist harmonized track to IndexedDB:', err);
       }
@@ -5787,7 +5956,7 @@ export default function App() {
               <div className="relative z-10 px-3 py-1.5 rounded-xl bg-rose-950/70 border border-rose-500/30 text-rose-200 text-xs flex items-center justify-between gap-2 shrink-0">
                 <span className="truncate">{playbackError}</span>
                 <button
-                  onClick={() => handleSelectOrRestoreFolder(rememberedFolder.handle)}
+                  onClick={() => handleSelectOrRestoreFolder(rememberedFolder.handle || (rememberedFolder.path ? true : null))}
                   className="underline text-rose-300 hover:text-white font-medium shrink-0"
                 >
                   Relink
@@ -5885,8 +6054,8 @@ export default function App() {
               </div>
 
               {/* Unified Transport Controls Row */}
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1">
+              <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 w-full">
+                <div className="flex items-center justify-start gap-1">
                   <button
                     onClick={() => setShuffle((s) => !s)}
                     className={`p-1.5 rounded-xl transition ${shuffle ? 'text-amber-400 bg-amber-500/15' : 'text-zinc-400 hover:text-white hover:bg-white/5'
@@ -5909,7 +6078,7 @@ export default function App() {
                   </button>
                 </div>
 
-                <div className="flex items-center gap-2.5">
+                <div className="flex items-center justify-center gap-2.5">
                   <button
                     onClick={handlePrevTrack}
                     className="p-2 rounded-xl bg-white/[0.06] hover:bg-white/15 text-zinc-100 transition"
@@ -5940,7 +6109,7 @@ export default function App() {
                   </button>
                 </div>
 
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center justify-end gap-1.5">
                   <button
                     onClick={() => setIsMuted((m) => !m)}
                     className="p-1.5 rounded-xl text-zinc-300 hover:text-white transition"
@@ -5972,6 +6141,24 @@ export default function App() {
                     }}
                     className="aurelia-slider-progress w-16 sm:w-20 h-1.5 rounded-full appearance-none cursor-pointer"
                   />
+                  <button
+                    onClick={() => setActiveTab('settings')}
+                    className={`p-1.5 rounded-xl transition relative ${
+                      (settings.channelBalance !== 0 || (settings.leftChannelVolume ?? 1) !== 1 || (settings.rightChannelVolume ?? 1) !== 1)
+                        ? 'text-amber-400 bg-amber-500/15'
+                        : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/5'
+                    }`}
+                    title={
+                      (settings.channelBalance !== 0 || (settings.leftChannelVolume ?? 1) !== 1 || (settings.rightChannelVolume ?? 1) !== 1)
+                        ? `L/R Balance: ${settings.channelBalance > 0 ? `R +${settings.channelBalance}%` : settings.channelBalance < 0 ? `L +${Math.abs(settings.channelBalance)}%` : 'Offset'}`
+                        : t('channelBalance')
+                    }
+                  >
+                    <Headphones className="w-3.5 h-3.5" />
+                    {(settings.channelBalance !== 0 || (settings.leftChannelVolume ?? 1) !== 1 || (settings.rightChannelVolume ?? 1) !== 1) && (
+                      <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-400 ring-2 ring-zinc-950" />
+                    )}
+                  </button>
                 </div>
               </div>
 
@@ -6088,6 +6275,23 @@ export default function App() {
                     )}
                   </div>
                 </div>
+
+                {rememberedFolder.name && (rememberedFolder.isAvailable === false || rememberedFolder.permissionState === 'unavailable' || rememberedFolder.permissionState === 'prompt') && (
+                  <div className="px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-700 dark:text-amber-300 text-xs flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <AlertCircle className="w-4 h-4 text-amber-500 shrink-0" />
+                      <span className="truncate">
+                        {t('folderUnavailable')} ({rememberedFolder.name})
+                      </span>
+                    </div>
+                    <button
+                      onClick={handlePickAndImportFolder}
+                      className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold text-xs shrink-0 transition"
+                    >
+                      {t('reconnectFolder')}
+                    </button>
+                  </div>
+                )}
 
                 {importProgress && importProgress.active && (
                   <div className="flex flex-col gap-1">
@@ -6990,9 +7194,9 @@ export default function App() {
                 <span>{t('settings')}</span>
               </h2>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="flex flex-col gap-4 max-w-2xl">
                 {/* Theme & Accent Color Section */}
-                <div className="md:col-span-2 p-4 sm:p-5 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-3.5">
+                <div className="p-4 sm:p-5 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-3.5">
                   <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/5">
                     <div className="flex items-center gap-2">
                       <div className="w-7 h-7 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center">
@@ -7056,102 +7260,53 @@ export default function App() {
                         <span className="text-xs font-semibold text-zinc-200">{t('languageSelect')}</span>
                       </div>
                       <div className="flex items-center gap-1 bg-zinc-950/80 p-1 rounded-xl border border-white/10">
-                        <button
-                          onClick={() => updateSetting('language', 'vi')}
-                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${settings.language === 'vi'
-                            ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                            : 'text-zinc-400 hover:text-white'
-                            }`}
-                        >
-                          Tiếng Việt
-                        </button>
-                        <button
-                          onClick={() => updateSetting('language', 'en')}
-                          className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${settings.language === 'en'
-                            ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                            : 'text-zinc-400 hover:text-white'
-                            }`}
-                        >
-                          English
-                        </button>
+                        {['vi', 'en'].map((lng) => (
+                          <button
+                            key={lng}
+                            onClick={() => updateSetting('language', lng)}
+                            className={`px-3 py-1 rounded-lg text-xs font-semibold uppercase tracking-wider transition ${settings.language === lng
+                              ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                              : 'text-zinc-400 hover:text-white'
+                              }`}
+                          >
+                            {lng}
+                          </button>
+                        ))}
                       </div>
                     </div>
                   </div>
 
-                  {/* Album Cover Theme Sync */}
-                  <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-zinc-900/50 border border-white/[0.06]">
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
-                      <div className="flex flex-col min-w-0">
-                        <span className="text-xs font-semibold text-zinc-200 truncate">{t('autoThemeFromAlbum')}</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        onClick={handleExtractAlbumColor}
-                        disabled={!currentTrack?.coverUrl}
-                        className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium text-amber-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 transition"
-                        title={t('extractNow')}
-                      >
-                        <Sparkles className="w-3 h-3" />
-                        <span>{t('extractNow')}</span>
-                      </button>
-                      <label className="relative inline-flex items-center cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={Boolean(settings.autoAlbumTheme)}
-                          onChange={(e) => updateSetting('autoAlbumTheme', e.target.checked)}
-                          className="sr-only peer"
-                        />
-                        <div className="w-9 h-5 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-amber-500" />
-                      </label>
-                    </div>
-                  </div>
-
-                  {/* Preset Palettes (from theme.js) */}
-                  <div className="flex flex-col gap-2 pt-1">
-                    <span className="text-xs font-medium text-zinc-300">
-                      {t('presetPalettes')}
-                    </span>
-                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
-                      {Object.values(ACCENT_PALETTES).map((pal) => {
-                        const isSelected = settings.accentColor === pal.id;
+                  {/* Accent Swatch Palette */}
+                  <div className="flex flex-col gap-2 pt-1 border-t border-white/5">
+                    <span className="text-xs text-zinc-400 font-medium">Palette Accent</span>
+                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                      {Object.values(ACCENT_PALETTES).map((p) => {
+                        const isSelected = settings.accentColor === p.id;
                         return (
                           <button
-                            key={pal.id}
-                            onClick={() => updateSetting('accentColor', pal.id)}
-                            className={`flex flex-col items-center gap-2 p-3 rounded-xl border text-center transition group relative overflow-hidden ${isSelected
-                              ? 'bg-amber-500/15 border-amber-400/60 shadow-lg shadow-amber-500/15 ring-1 ring-amber-400/30'
-                              : 'bg-zinc-900/50 border-white/[0.06] hover:bg-white/5 hover:border-white/15'
+                            key={p.id}
+                            onClick={() => updateSetting('accentColor', p.id)}
+                            className={`flex items-center gap-2 px-2.5 py-1.5 rounded-xl border text-xs font-medium transition ${isSelected
+                              ? 'border-white/40 bg-white/10 shadow-sm'
+                              : 'border-white/5 bg-zinc-900/40 hover:bg-white/5 text-zinc-400'
                               }`}
                           >
                             <span
-                              className="w-6 h-6 rounded-full shrink-0 ring-2 ring-white/30 shadow-md transition-transform group-hover:scale-110 flex items-center justify-center"
-                              style={{ backgroundColor: pal.swatch }}
-                            >
-                              {isSelected && <Check className="w-3.5 h-3.5 text-zinc-950 stroke-[3]" />}
-                            </span>
-                            <div className="flex flex-col min-w-0 w-full">
-                              <span className="text-xs font-semibold truncate text-zinc-200">
-                                {pal.label.split(' ')[0]}
-                              </span>
-                              <span className="text-[10px] font-mono text-zinc-500 truncate">
-                                {pal.swatch}
-                              </span>
-                            </div>
+                              className="w-3.5 h-3.5 rounded-full shrink-0 ring-1 ring-white/20"
+                              style={{ backgroundColor: p.swatch }}
+                            />
+                            <span className={isSelected ? 'text-white' : 'text-zinc-300'}>{p.label}</span>
                           </button>
                         );
                       })}
                     </div>
                   </div>
 
-                  {/* Custom Color Picker & Live Hex Input */}
-                  <div className="flex flex-col gap-2.5 pt-2 border-t border-white/5">
+                  {/* Custom Hex Color & Album Color Extraction */}
+                  <div className="pt-2 border-t border-white/5 flex flex-col gap-2.5">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-medium text-zinc-300">
-                        {t('customColorPicker')}
-                      </span>
-                      {settings.accentColor !== 'amber' && (
+                      <span className="text-xs text-zinc-300 font-medium">{t('customHexAccent')}</span>
+                      {settings.accentColor === 'custom' && (
                         <button
                           onClick={() => {
                             setLocalCustomHex('#f59e0b');
@@ -7267,185 +7422,148 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="p-4 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2.5">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{t('libraryAndAutomation')}</h3>
-
-                  <div className="flex flex-wrap items-center justify-between gap-2 py-1">
-                    <span className="text-xs text-zinc-300">{t('musicFolder')}</span>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        onClick={handleRescanFolder}
-                        className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-300 text-xs flex items-center gap-1"
-                        title={t('rescanFolder')}
-                      >
-                        <RefreshCw className="w-3 h-3 text-amber-400" />
-                        <span>{t('rescan')}</span>
-                      </button>
-                      <button
-                        onClick={handlePickAndImportFolder}
-                        className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold text-xs"
-                      >
-                        {rememberedFolder.name ? t('change') : t('select')}
-                      </button>
-                      {rememberedFolder.name && (
+                {/* Simplified Channel Balance Section */}
+                <div className="p-4 sm:p-5 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-3.5">
+                  <div className="flex items-center justify-between pb-2 border-b border-white/5">
+                    <div className="flex items-center gap-2">
+                      <Headphones className="w-4 h-4 text-amber-400" />
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-100">
+                        {t('channelBalance')}
+                      </h3>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-mono font-semibold text-amber-400">
+                        {settings.channelBalance === 0 && (settings.leftChannelVolume ?? 1) === 1 && (settings.rightChannelVolume ?? 1) === 1
+                          ? '0'
+                          : settings.channelBalance < 0
+                          ? `L +${Math.abs(settings.channelBalance)}%`
+                          : settings.channelBalance > 0
+                          ? `R +${settings.channelBalance}%`
+                          : 'Offset'}
+                      </span>
+                      {(settings.channelBalance !== 0 || (settings.leftChannelVolume ?? 1) !== 1 || (settings.rightChannelVolume ?? 1) !== 1) && (
                         <button
-                          onClick={handleForgetRememberedFolder}
-                          className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-300 text-xs"
+                          onClick={() => updateSettings({ channelBalance: 0, leftChannelVolume: 1.0, rightChannelVolume: 1.0 })}
+                          className="text-[10px] px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition"
                         >
-                          {t('forget')}
+                          Reset
                         </button>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between py-1">
-                    <div className="flex flex-col">
-                      <span className="text-xs text-zinc-300">{t('removeDuplicates')}</span>
-
-                    </div>
-                    <button
-                      onClick={handleFindAndRemoveDuplicates}
-                      className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-medium flex items-center gap-1.5 transition"
-                    >
-                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                      <span>{t('cleanDuplicates')}</span>
-                    </button>
+                  {/* Master Balance Slider (L <---> R) */}
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs font-mono font-semibold text-zinc-400 w-4 text-right">L</span>
+                    <input
+                      type="range"
+                      min={-100}
+                      max={100}
+                      step={1}
+                      value={settings.channelBalance ?? 0}
+                      onChange={(e) => updateSetting('channelBalance', parseInt(e.target.value, 10))}
+                      className="w-full h-1.5 rounded-lg appearance-none cursor-pointer bg-zinc-800 accent-amber-500"
+                    />
+                    <span className="text-xs font-mono font-semibold text-zinc-400 w-4">R</span>
                   </div>
 
-                  <div className="flex items-center justify-between py-1">
-                    <div className="flex flex-col">
-                      <span className="text-xs text-zinc-300">{t('auditMetadata')}</span>
-
+                  {/* Dual Channel Sliders */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-zinc-900/50 border border-white/[0.04]">
+                      <span className="text-xs text-zinc-300 w-9 shrink-0 font-medium">Trái</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        value={settings.leftChannelVolume ?? 1.0}
+                        onChange={(e) => updateSetting('leftChannelVolume', parseFloat(e.target.value))}
+                        className="w-full h-1.5 rounded-lg appearance-none cursor-pointer bg-zinc-800 accent-sky-400"
+                      />
+                      <span className="text-xs font-mono text-sky-400 w-10 text-right shrink-0">
+                        {Math.round((settings.leftChannelVolume ?? 1.0) * 100)}%
+                      </span>
+                      <button
+                        onClick={() => playChannelTestTone('left')}
+                        className="px-2 py-1 rounded-lg text-[10px] bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 font-medium shrink-0 transition"
+                      >
+                        Test
+                      </button>
                     </div>
-                    <button
-                      onClick={handleRunSmartMetadataAudit}
-                      className="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 text-xs font-medium flex items-center gap-1.5 transition"
-                    >
-                      <Shield className="w-3.5 h-3.5 text-sky-400" />
-                      <span>{t('smartScan')}</span>
-                    </button>
+
+                    <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-zinc-900/50 border border-white/[0.04]">
+                      <span className="text-xs text-zinc-300 w-9 shrink-0 font-medium">Phải</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        value={settings.rightChannelVolume ?? 1.0}
+                        onChange={(e) => updateSetting('rightChannelVolume', parseFloat(e.target.value))}
+                        className="w-full h-1.5 rounded-lg appearance-none cursor-pointer bg-zinc-800 accent-emerald-400"
+                      />
+                      <span className="text-xs font-mono text-emerald-400 w-10 text-right shrink-0">
+                        {Math.round((settings.rightChannelVolume ?? 1.0) * 100)}%
+                      </span>
+                      <button
+                        onClick={() => playChannelTestTone('right')}
+                        className="px-2 py-1 rounded-lg text-[10px] bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 font-medium shrink-0 transition"
+                      >
+                        Test
+                      </button>
+                    </div>
                   </div>
+                </div>
+
+                {/* Core Preferences: gapless, rememberMusicFolder, closeToTray, keyboardShortcuts */}
+                <div className="p-4 sm:p-5 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-1">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 pb-2 border-b border-white/5">
+                    Tùy chọn
+                  </h3>
 
                   {[
                     ['gapless', t('gaplessPlayback')],
                     ['rememberMusicFolder', t('rememberMusicFolder')],
                     ['closeToTray', t('closeToTray')],
-                    ['autoOnlineMetadata', t('autoOnlineMetadata')],
-                    ['autoOnlineArtwork', t('autoOnlineArtwork')],
-                    ['autoOnlineLyrics', t('autoOnlineLyrics')],
-                    ['persistBlobsInIdb', t('persistBlobsInIdb')],
-                    ['ambientGlow', t('ambientGlow')],
                     ['keyboardShortcuts', t('keyboardShortcuts')]
                   ].map(([key, label]) => (
-                    <label key={key} className="flex items-center justify-between text-xs text-zinc-300 cursor-pointer py-1">
+                    <label key={key} className="flex items-center justify-between text-xs text-zinc-200 cursor-pointer py-2.5 hover:text-white transition border-b border-white/[0.03] last:border-b-0">
                       <span>{label}</span>
                       <input
                         type="checkbox"
                         checked={Boolean(settings[key])}
                         onChange={(e) => updateSetting(key, e.target.checked)}
-                        className="accent-amber-500"
+                        className="accent-amber-500 w-4 h-4 rounded cursor-pointer"
                       />
                     </label>
                   ))}
-
-                  <div className="pt-2 border-t border-white/5 flex items-center justify-between">
-                    <span className="text-xs text-zinc-400">{t('localDatabase')}</span>
-                    <button
-                      onClick={() =>
-                        setConfirmModal({
-                          title: t('purgeModalTitle'),
-                          message: t('purgeModalDesc'),
-                          onConfirm: async () => {
-                            await dbClearAll();
-                            shouldPlayRef.current = false;
-                            isTransitioningTrackRef.current = false;
-                            cancelHandoff();
-                            preloadedRef.current = null;
-                            deckElsRef.current.forEach((el) => {
-                              if (el) {
-                                el.pause();
-                                el.removeAttribute('src');
-                              }
-                            });
-                            setTracks([]);
-                            setQueue([]);
-                            setCurrentTrackId(null);
-                            setSelectedAlbumId(null);
-                            setIsPlaying(false);
-                            setRememberedFolder({
-                              handle: null,
-                              name: null,
-                              mode: null,
-                              permissionState: 'unknown',
-                              trackCount: 0,
-                              lastScannedAt: null
-                            });
-                            showToast(t('databaseCleared'), 'info');
-                          }
-                        })
-                      }
-                      className="px-2.5 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 text-xs font-medium"
-                    >
-                      {t('purge')}
-                    </button>
-                  </div>
                 </div>
 
-                <div className="flex flex-col gap-3">
-                  <div className="p-4 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2">
-                    <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{t('shortcuts')}</h3>
-                    <div className="grid grid-cols-2 gap-1.5 text-xs">
-                      {[
-                        ['Space', 'Play / Pause'],
-                        ['1 - 4', 'EQ Profiles'],
-                        ['E', 'EQ Bypass'],
-                        ['← / →', 'Seek 5s'],
-                        ['↑ / ↓', 'Volume'],
-                        ['M', 'Mute'],
-                        ['S / R', 'Shuffle / Repeat'],
-                        ['F / Esc', 'Fullscreen / Exit']
-                      ].map(([key, desc]) => (
-                        <div key={key} className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-zinc-900/60">
-                          <kbd className="text-amber-300 font-mono text-[11px]">{key}</kbd>
-                          <span className="text-zinc-400">{desc}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="p-4 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{t('environmentCodecs')}</span>
-                      <button
-                        onClick={runSelfDiagnosticsSuite}
-                        className="px-2.5 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-[11px] font-medium"
-                      >
-                        {t('selfTest')}
-                      </button>
-                    </div>
-                    <div className="flex flex-wrap gap-1.5 pt-1">
-                      {envStatus.codecMatrix.map((c) => (
-                        <span
-                          key={c.ext}
-                          className={`text-[10px] font-mono px-2 py-0.5 rounded ${c.support.includes('Unsupported')
-                            ? 'bg-rose-500/15 text-rose-300'
-                            : 'bg-white/5 text-zinc-300'
-                            }`}
-                        >
-                          {c.ext}
-                        </span>
-                      ))}
-                    </div>
-                    {diagnosticReport && (
-                      <div className="text-[11px] font-mono text-emerald-400 pt-1">
-                        ✓ {diagnosticReport.inferredMeta} • Sync & Dedup Verified
+                {/* Keyboard Shortcuts List */}
+                <div className="p-4 sm:p-5 rounded-2xl bg-zinc-950/60 border border-white/[0.06] flex flex-col gap-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 pb-2 border-b border-white/5">
+                    {t('shortcuts')}
+                  </h3>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs pt-1">
+                    {[
+                      ['Space', 'Play / Pause'],
+                      ['1 - 4', 'EQ Profiles'],
+                      ['E', 'EQ Bypass'],
+                      ['← / →', 'Seek 5s'],
+                      ['↑ / ↓', 'Volume'],
+                      ['M', 'Mute'],
+                      ['S / R', 'Shuffle / Repeat'],
+                      ['F / Esc', 'Fullscreen']
+                    ].map(([key, desc]) => (
+                      <div key={key} className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-zinc-900/60">
+                        <kbd className="text-amber-300 font-mono text-[11px]">{key}</kbd>
+                        <span className="text-zinc-400 text-[11px]">{desc}</span>
                       </div>
-                    )}
+                    ))}
                   </div>
                 </div>
               </div>
-            </div>
-          )}
+            </div>          )}
         </section>
       </main>
 

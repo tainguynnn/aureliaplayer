@@ -270,7 +270,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurelia-audio"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "log",
  "rfd",
@@ -280,6 +280,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-log",
+ "tauri-plugin-single-instance",
 ]
 
 [[package]]
@@ -3780,6 +3781,22 @@ dependencies = [
  "tauri-plugin",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "tauri-plugin-single-instance"
+version = "2.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "561cd99484561bc39c954768e7b41a66cebbe1ac3d9d081c34361f740c489e2c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]

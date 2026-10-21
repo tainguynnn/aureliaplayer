@@ -5,6 +5,47 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Aurelia Audio</title>
+    <script>
+      (function() {
+        function tryOpenDevTools() {
+          try {
+            if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
+              window.__TAURI_INTERNALS__.invoke('open_devtools');
+            } else if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
+              window.__TAURI__.core.invoke('open_devtools');
+            }
+          } catch(e) {}
+        }
+
+        window.addEventListener('keydown', function(e) {
+          if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && e.key === 'I')) {
+            tryOpenDevTools();
+          }
+        });
+
+        function renderError(type, msg, stack) {
+          try {
+            tryOpenDevTools();
+            var banner = document.getElementById('aurelia-fatal-error');
+            if (!banner) {
+              banner = document.createElement('div');
+              banner.id = 'aurelia-fatal-error';
+              banner.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#140505;color:#fca5a5;padding:28px;z-index:9999999;font-family:Consolas,monospace;white-space:pre-wrap;overflow:auto;user-select:text;';
+              var target = document.body || document.documentElement;
+              if (target) target.appendChild(banner);
+              else document.addEventListener('DOMContentLoaded', function() { (document.body || document.documentElement).appendChild(banner); });
+            }
+            banner.textContent += '\n[' + type + ']: ' + msg + (stack ? '\nStack:\n' + stack : '') + '\n';
+          } catch(e) {}
+        }
+        window.addEventListener('error', function(e) {
+          renderError('Uncaught Error', (e.message || e) + ' (' + (e.filename || '') + ':' + (e.lineno || '') + ':' + (e.colno || '') + ')', e.error ? e.error.stack : null);
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+          renderError('Unhandled Promise Rejection', (e.reason?.message || e.reason), (e.reason?.stack || ''));
+        });
+      })();
+    </script>
   </head>
   <body style="margin: 0; padding: 0; background-color: #07080c; overflow: hidden;">
     <div id="root" style="width: 100%; height: 100%;"></div>
