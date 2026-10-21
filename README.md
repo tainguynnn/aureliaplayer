@@ -170,6 +170,13 @@ aureliaplayer/
 
 ---
 
+## 🤖 AI Disclaimer
+
+This project is developed with the assistance of AI.
+
+---
+
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
+
